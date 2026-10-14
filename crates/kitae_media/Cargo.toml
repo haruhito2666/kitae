@@ -1,0 +1,27 @@
+[package]
+name = "kitae_media"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+kitae_style = { path = "../kitae_style" }
+png = "0.18"
+zune-jpeg = "0.4"
+gif = "0.13"
+image-webp = "0.2"
+# Q10: SVG (static). usvg drops <script>/SMIL at parse, so the render is
+# script-free by construction.
+resvg = "0.45"
+# Q11: web font containers — WOFF 1.0 per-table zlib, WOFF 2.0 brotli.
+flate2 = "1"
+brotli = "8"
+# F1/F2/F3: audio decode (mp3/flac/vorbis/wav/aac) + mp4/mkv demux. Pure
+# Rust per CPP_ROLE.md; video demux (mp4 boxes, EBML/WebM) is hand-rolled
+# in `video.rs` because symphonia's isomp4 demuxer is audio-focused. Opus
+# decode is NOT in symphonia 0.5 (feature never shipped) — opus-in-webm is
+# a recorded F-bucket deferral (parity plan §F note).
+symphonia = { version = "0.5", default-features = false, features = ["mp3", "flac", "wav", "ogg", "vorbis", "aac", "isomp4", "mkv", "pcm"] }
+
+[dev-dependencies]
+crc32fast = "1"

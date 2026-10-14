@@ -1,0 +1,12 @@
+/target/
+/app/Kitae.app/
+/app/include/
+/app/.build-tmp/
+/app/.module-cache/
+/native/build/
+/main
+/24484
+.mimosa/
+/*.crate
+.DS_Store
+*.dSYM/

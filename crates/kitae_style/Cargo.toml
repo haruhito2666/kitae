@@ -1,0 +1,12 @@
+[package]
+name = "kitae_style"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+kitae_css = { path = "../kitae_css" }
+kitae_dom = { path = "../kitae_dom" }
+
+[dev-dependencies]
+kitae_html = { path = "../kitae_html" }

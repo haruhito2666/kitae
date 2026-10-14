@@ -1,0 +1,51 @@
+[package]
+name = "kitae_net"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+url = { workspace = true }
+reqwest = { workspace = true }
+percent-encoding = { workspace = true }
+psl = "2"
+
+# G1: HTTP/2 comes from reqwest's `http2` feature (ALPN on https, h2c via a
+# prior-knowledge escape hatch). No extra crate needed here.
+
+# G4 auth: Basic (base64) + Digest MD5 (RFC 7616), cnonce from the OS CSPRNG.
+base64 = "0.22"
+md-5 = "0.10"
+getrandom = "0.2"
+# H6: session credentials (the `auth\t` → `set_auth` flow) are zeroized on
+# replace/drop so sign-in secrets do not idle in freed heap (S-7).
+zeroize = "1"
+
+# G6 WebSocket: the RFC 6455 accept key is SHA-1 (same RustCrypto family as
+# md-5 above; pure Rust).
+sha1 = "0.10"
+
+# G6 WebSocket (wss) + G2 HTTP/3: rustls with the **ring** provider only —
+# the default `aws-lc-rs` builds C code, and CPP_ROLE.md reserves C for media
+# codecs + HarfBuzz. Unifies with the rustls reqwest already pulls.
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
+rustls-pki-types = "1"
+webpki-roots = "0.26"
+tokio = { version = "1", default-features = false, features = ["rt", "time"] }
+# `runtime-tokio` is required even though we block_on manually: quinn's
+# Endpoint::client/server resolve their socket driver through
+# default_runtime(), which needs the tokio feature to see the ambient
+# runtime. Crypto stays ring-only (no aws-lc-rs C build).
+quinn = { version = "0.11", default-features = false, features = ["rustls", "runtime-tokio", "log", "ring"] }
+h3 = "0.0.7"
+h3-quinn = "0.0.9"
+http = "1"
+# G2: h3's recv_data yields `impl Buf`; the trait methods come from `bytes`.
+bytes = "1"
+
+# G3 test fixtures: compress bodies in-test to prove the decoder path.
+[dev-dependencies]
+flate2 = "1"
+brotli = "8"
+# G2 test fixtures: self-signed loopback certificates.
+rcgen = "0.13"

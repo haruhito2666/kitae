@@ -1,0 +1,14 @@
+[package]
+name = "kitae"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "kitae"
+path = "src/main.rs"
+
+[dependencies]
+kitae_core = { path = "../kitae_core" }
+kitae_layout = { path = "../kitae_layout" }
+kitae_render = { path = "../kitae_render" }

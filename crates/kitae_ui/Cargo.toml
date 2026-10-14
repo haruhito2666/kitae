@@ -1,0 +1,19 @@
+[package]
+name = "kitae_ui"
+description = "Reactive UI core for Kitae: view!, signals, diffing, and the v1 patch-op surface. No engine dependency."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lib]
+# The dylib flavor is what `kitae dev`'s hot reload needs: a site dylib
+# loaded with dlopen links THIS copy, so host and site share one image of
+# kitae_ui — one thread_local signal universe. Everything else still links
+# the rlib.
+crate-type = ["rlib", "dylib"]
+
+[dependencies]
+# version+path dual dep: the path wins inside the workspace; once
+# kitae_ui_macros is on crates.io the version resolves for published
+# consumers without any further edit.
+kitae_ui_macros = { version = "0.1.0", path = "../kitae_ui_macros" }

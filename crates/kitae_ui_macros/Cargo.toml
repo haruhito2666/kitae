@@ -1,0 +1,9 @@
+[package]
+name = "kitae_ui_macros"
+description = "Proc macros for kitae_ui: the view! markup macro and #[component]."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lib]
+proc-macro = true

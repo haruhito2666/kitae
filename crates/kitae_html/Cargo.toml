@@ -1,0 +1,8 @@
+[package]
+name = "kitae_html"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+kitae_dom = { path = "../kitae_dom" }

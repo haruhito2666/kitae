@@ -1,0 +1,21 @@
+[package]
+name = "kitae_render_gpu"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lib]
+name = "kitae_render_gpu"
+crate-type = ["rlib", "staticlib"]
+
+[dependencies]
+kitae_core = { path = "../kitae_core" }
+kitae_layout = { path = "../kitae_layout" }
+kitae_media = { path = "../kitae_media" }
+kitae_style = { path = "../kitae_style" }
+wgpu = "24"
+pollster = "0.3"
+bytemuck = { version = "1", features = ["derive"] }
+
+[dev-dependencies]
+kitae_html = { path = "../kitae_html" }

@@ -1,0 +1,11 @@
+[package]
+name = "kitae_shape"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+unicode-bidi = "0.3"
+unicode-linebreak = "0.1"
+rustybuzz = "0.20"
+hyphenation = { version = "0.8.4", features = ["embed_en-us"] }

@@ -1,0 +1,45 @@
+[package]
+name = "kitae_core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lib]
+name = "kitae_core"
+# staticlib: linked into the Swift macOS app. rlib: linked into the SDL shell
+# and test harnesses. The Rust engine itself is pure — no C++ on this path.
+crate-type = ["staticlib", "rlib"]
+
+[dependencies]
+kitae_css = { path = "../kitae_css" }
+kitae_dom = { path = "../kitae_dom" }
+kitae_html = { path = "../kitae_html" }
+kitae_layout = { path = "../kitae_layout" }
+kitae_media = { path = "../kitae_media" }
+kitae_net = { path = "../kitae_net" }
+kitae_qtsq = { path = "../kitae_qtsq" }
+kitae_shape = { path = "../kitae_shape" }
+kitae_style = { path = "../kitae_style" }
+kitae_ui = { path = "../kitae_ui" }
+# S-7 (SECURITY_AUDIT.md): the QTSQ unlock password is zeroized on drop —
+# the one credential the engine holds should not idle in freed heap.
+zeroize = "1"
+# Phase 2 (UI_LIBRARY_PLAN.md): the Live client — patch applier + event
+# sender against a kitae_live server. Feature-gated so embedders that
+# never speak KTLV link none of it.
+kitae_live = { path = "../kitae_live", optional = true }
+percent-encoding = { workspace = true }
+
+[features]
+default = []
+live = ["dep:kitae_live"]
+
+[dev-dependencies]
+# Q8: the engine-level animation test builds its GIF fixture with the same
+# encoder kitae_media's unit tests use.
+gif = "0.13"
+# The engine-level APNG animation test builds its fixture inline.
+flate2 = "1"
+# Q9: the engine-level WebP test encodes its fixture with the same crate
+# kitae_media decodes with.
+image-webp = "0.2"

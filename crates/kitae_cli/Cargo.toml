@@ -1,0 +1,17 @@
+[package]
+name = "kitae_cli"
+description = "The `kitae` developer CLI: scaffold, run, and static-export Kitae Live sites (kitae new / dev / build)."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "kitae"
+path = "src/main.rs"
+
+[dependencies]
+# version+path dual deps — see kitae_ui's note. Once the crates are on
+# crates.io, `cargo install kitae_cli` scaffolds sites against the
+# published versions automatically.
+kitae_ui = { version = "0.1.0", path = "../kitae_ui" }
+kitae_live = { version = "0.1.0", path = "../kitae_live" }

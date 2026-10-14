@@ -1,0 +1,35 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/kitae",
+    "crates/kitae_core",
+    "crates/kitae_net",
+    "crates/kitae_dom",
+    "crates/kitae_html",
+    "crates/kitae_css",
+    "crates/kitae_style",
+    "crates/kitae_layout",
+    "crates/kitae_media",
+    "crates/kitae_render",
+    "crates/kitae_render_gpu",
+    "crates/kitae_shape",
+    "crates/kitae_qtsq",
+    "crates/kitae_ui",
+    "crates/kitae_ui_macros",
+    "crates/kitae_live",
+    "crates/kitae_cli",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+
+[workspace.dependencies]
+url = "2"
+reqwest = { version = "0.12", default-features = false, features = ["blocking", "rustls-tls", "http2", "gzip", "brotli", "deflate"] }
+percent-encoding = "2"
+
+[profile.release]
+lto = "thin"
+strip = "symbols"

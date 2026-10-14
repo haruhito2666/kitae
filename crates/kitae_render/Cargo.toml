@@ -1,0 +1,15 @@
+[package]
+name = "kitae_render"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+kitae_layout = { path = "../kitae_layout" }
+kitae_style = { path = "../kitae_style" }
+# Payload resolution only: submit() resolves DisplayImage payload ids against
+# the engine's raster side-table (J3/J5) so the SDL shell paints real rasters.
+kitae_core = { path = "../kitae_core" }
+
+[build-dependencies]
+cmake = "0.1"

@@ -1,0 +1,41 @@
+# Kitae dependency policy (S-9, SECURITY_AUDIT.md).
+#
+# Run with:  cargo deny check licenses   (or tools/deps-audit.sh for both
+# licenses and advisories). The engine is pure Rust, but it links C codecs
+# (QTSQ, opus) — a permissive, OSI-clean allowlist keeps the tree auditable.
+
+[licenses]
+allow = [
+    "MIT",
+    "MPL-2.0",
+    "Apache-2.0",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "Zlib",
+    "Unicode-3.0",
+    "CC0-1.0",
+    "CDLA-Permissive-2.0",
+]
+# cargo-deny guesses licenses from metadata; below this confidence it asks.
+confidence-threshold = 0.8
+
+[advisories]
+# The rustsec advisory database (crates.io index). Fetched on first run.
+db-path = "~/.cargo/advisory-db"
+yanked = "deny"
+
+# Ignored advisories — four *unmaintained* notices (the crates are frozen
+# upstream, so no fixed version exists to upgrade to). Their risk is
+# maintenance staleness, not an exploitable flaw; active-CVE advisories and
+# yanked crates remain hard failures.
+# - RUSTSEC-2024-0436: `paste` (dev-only test macro helper).
+# - RUSTSEC-2026-0206 / RUSTSEC-2026-0192: `rustybuzz` + `ttf-parser` —
+#   the shaping crates; the CPP_ROLE.md plan replaces them with link-in
+#   HarfBuzz.
+ignore = [
+    "RUSTSEC-2024-0436",
+    "RUSTSEC-2025-0141",
+    "RUSTSEC-2026-0206",
+    "RUSTSEC-2026-0192",
+]

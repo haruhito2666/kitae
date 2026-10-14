@@ -1,0 +1,17 @@
+[package]
+name = "kitae_live"
+description = "Kitae Live server: mounts kitae_ui components as websites — static HTML by default, patch streams over WebSocket for Kitae browsers."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lib]
+# See kitae_ui's note: hot reload dlopens site dylibs against the shared
+# dylib flavor so host and site run one kitae_live image.
+crate-type = ["rlib", "dylib"]
+
+[dependencies]
+# version+path dual dep — see kitae_ui's note.
+kitae_ui = { version = "0.1.0", path = "../kitae_ui" }
+# S-3 (SECURITY_AUDIT.md): session tokens draw from the OS CSPRNG.
+getrandom = "0.2"
