@@ -1,0 +1,6 @@
+# Build context hygiene for the kitae-server image.
+target/
+app/build/
+*.qtsq
+.git/
+crates/.mimosa/

@@ -214,6 +214,13 @@ protocol EngineDelegate: AnyObject {
     /// H6: the loaded page carries a login form (`loginform\t{form}\t{user}`
     /// `\t{pass}` ids). The host can prefill from its Keychain store.
     func engineDidFindLogin(_ engine: EngineController, formId: String, userFieldId: String, passFieldId: String)
+    /// B4: the engine answered an agent verb (the reply JSON: `{ok, verb,
+    /// result, journal}` or `{ok:false, kind, message, pending}`).
+    func engineDidAnswerAgent(_ engine: EngineController, reply: String)
+    /// B4: the whole activity journal arrived (JSON array, oldest first).
+    func engineDidReceiveAgentJournal(_ engine: EngineController, journal: String)
+    /// B4: the session's grants/declarations changed (JSON object).
+    func engineDidUpdateAgentPolicy(_ engine: EngineController, policy: String)
     /// H6: a filled password input was in a submitting form
     /// (`pwsave\t{origin}\t{user}\t{pass}`) — offer to save it.
     func engineDidSubmitLoginForm(_ engine: EngineController, origin: String, user: String, password: String)
@@ -245,6 +252,10 @@ extension EngineDelegate {
     /// Default: ignore inspector reports.
     func engineDidReceiveInspectInfo(_ engine: EngineController, info: String) {}
     func engineDidRequestInsecureNavigation(_ engine: EngineController, url: String) {}
+    /// Default: ignore agent replies (only the panel listens).
+    func engineDidAnswerAgent(_ engine: EngineController, reply: String) {}
+    func engineDidReceiveAgentJournal(_ engine: EngineController, journal: String) {}
+    func engineDidUpdateAgentPolicy(_ engine: EngineController, policy: String) {}
 }
 
 /// H1: one row in the Downloads panel, parsed from the engine's
@@ -302,6 +313,19 @@ final class EngineController {
         vtable.metrics = kitaeMetrics
         vtable.x_height = kitaeXHeight
         engine = kitae_engine_new(Int32(max(1, viewport.width)), Int32(max(1, viewport.height)), &vtable)
+        // Page JavaScript is opt-in at the engine (command 53). Enabled here
+        // for every tab: the gated QuickJS tier runs the site's inline and
+        // content scripts under fixed time/memory budgets, and a page the
+        // tier cannot drive still gets the interstitial fallback.
+        command(KITAE_CMD_SET_PAGE_JS, 1, 0)
+        // B4: the agent plane's `screenshot` and `pdf` verbs need a
+        // rasterizer. The app links kitae_headless, which builds the pure-Rust
+        // one over the system's own fonts and hands the engine its vtable; 0
+        // means no usable fonts were found, and the verbs then answer with
+        // that reason rather than a blank image.
+        if let engine {
+            _ = kitae_headless_install_raster(engine, 2.0)
+        }
     }
 
     deinit {
@@ -456,6 +480,37 @@ final class EngineController {
         command(KITAE_CMD_RESOLVE_INSECURE_NAVIGATION, allow ? 1 : 0)
     }
 
+    // MARK: Agent plane (B4)
+
+    /// Run one agent verb, given as its wire JSON — the same vocabulary
+    /// kitae_mcp and kitae_server expose, on this tab's own browser. The
+    /// answer arrives on the notifications queue as `agent-result\t{json}`.
+    func agentAct(_ request: String) {
+        sendString(KITAE_CMD_AGENT_ACT, request)
+    }
+
+    /// Ask for the whole activity journal and the current grants.
+    func agentJournal() {
+        command(KITAE_CMD_AGENT_JOURNAL)
+    }
+
+    /// Record the user's approval for one verb name, or "*" for everything:
+    /// a grant outranks the session's read-only default, and the host
+    /// re-issues the act it was holding.
+    func agentGrant(_ verb: String) {
+        sendString(KITAE_CMD_AGENT_GRANT, verb)
+    }
+
+    /// Forget every grant (a new origin, or the panel's reset button).
+    func agentRevokeGrants() {
+        command(KITAE_CMD_AGENT_REVOKE_GRANTS)
+    }
+
+    /// The verbs a script declared, as a hint for the panel.
+    func agentDeclare(_ verbs: [String]) {
+        sendString(KITAE_CMD_AGENT_DECLARE, verbs.joined(separator: ","))
+    }
+
     func setSearchProvider(_ provider: SearchProviderSetting) {
         command(KITAE_CMD_SET_SEARCH_PROVIDER, Float(provider.rawValue))
     }
@@ -591,7 +646,12 @@ final class EngineController {
     private func drainNotifications() {
         guard let engine else { return }
         while true {
-            var buf = [CChar](repeating: 0, count: externalBufferLimit)
+            // Size the buffer from the queue's own length: take_notification
+            // drops an oversized message rather than putting it back, and an
+            // agent result can be large (an inline screenshot is base64).
+            var length = 0
+            guard kitae_engine_notification_available(engine, &length) == 1 else { break }
+            var buf = [CChar](repeating: 0, count: max(externalBufferLimit, length + 1))
             let got = buf.withUnsafeMutableBytes { raw -> Int32 in
                 kitae_engine_take_notification(engine, raw.bindMemory(to: CChar.self).baseAddress, raw.count)
             }
@@ -683,6 +743,26 @@ final class EngineController {
                     self,
                     info: String(message.dropFirst("inspectinfo\t".count))
                 )
+                continue
+            }
+            if message.starts(with: "agent-result\t") {
+                delegate?.engineDidAnswerAgent(
+                    self, reply: String(message.dropFirst("agent-result\t".count)))
+                continue
+            }
+            if message.starts(with: "agent-journal\t") {
+                delegate?.engineDidReceiveAgentJournal(
+                    self, journal: String(message.dropFirst("agent-journal\t".count)))
+                continue
+            }
+            if message.starts(with: "agent-policy\t") {
+                delegate?.engineDidUpdateAgentPolicy(
+                    self, policy: String(message.dropFirst("agent-policy\t".count)))
+                continue
+            }
+            if message.starts(with: "agent-raster\t") {
+                // The rasterizer is installed (or was refused, in which case
+                // the verbs say so themselves) — nothing to show the user.
                 continue
             }
             if message.starts(with: "insecure\t") {

@@ -1824,7 +1824,12 @@ fn parse_selectors(text: &str) -> Vec<Selector> {
         .collect()
 }
 
-fn parse_selector(s: &str) -> Option<Selector> {
+/// Parse one complex selector (`div.card > a[href]`, `#id`, `:is(a, b)`) —
+/// the entry point for engine *queries* (`querySelector`-shaped), as
+/// opposed to stylesheet parsing. A selector list is deliberately not
+/// accepted here: callers that want one parse it themselves so a bad
+/// alternative cannot silently become an empty match set.
+pub fn parse_selector(s: &str) -> Option<Selector> {
     let toks = split_compounds(s);
     if toks.is_empty() {
         return None;

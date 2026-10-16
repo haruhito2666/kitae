@@ -181,6 +181,13 @@ protocol TabManagerDelegate: AnyObject {
     func activeTabWantsInspect(node: Int)
     /// H5: the active tab's picked element's report arrived; the host
     /// shows it in its inspector panel.
+    /// B4: one agent verb was answered on the active tab's engine (the reply
+    /// JSON travels with it, journal rows included).
+    func activeTabAgentDidAnswer(reply: String)
+    /// B4: the active tab's whole activity journal arrived (JSON array).
+    func activeTabAgentJournalDidArrive(journal: String)
+    /// B4: the active tab's grants/declarations changed (JSON object).
+    func activeTabAgentPolicyDidChange(policy: String)
     func activeTabInspectInfoDidArrive(info: String)
     /// A Save-Page-as-QTSQ request finished on the active tab: `error` is
     /// nil and `path` names the archive written, or non-nil with the reason.
@@ -735,6 +742,24 @@ final class TabManager: NSObject, EngineDelegate {
         // H5: show only the active tab's report (the pick that asked for it).
         guard tabs.firstIndex(where: { $0.engine === engine }) == activeIndex else { return }
         delegate?.activeTabInspectInfoDidArrive(info: info)
+    }
+
+    func engineDidAnswerAgent(_ engine: EngineController, reply: String) {
+        // B4: only the active tab's agent is on screen — a background tab's
+        // engine can be driven by nothing today, and an unattended prompt
+        // would be a button the user cannot see.
+        guard tabs.firstIndex(where: { $0.engine === engine }) == activeIndex else { return }
+        delegate?.activeTabAgentDidAnswer(reply: reply)
+    }
+
+    func engineDidReceiveAgentJournal(_ engine: EngineController, journal: String) {
+        guard tabs.firstIndex(where: { $0.engine === engine }) == activeIndex else { return }
+        delegate?.activeTabAgentJournalDidArrive(journal: journal)
+    }
+
+    func engineDidUpdateAgentPolicy(_ engine: EngineController, policy: String) {
+        guard tabs.firstIndex(where: { $0.engine === engine }) == activeIndex else { return }
+        delegate?.activeTabAgentPolicyDidChange(policy: policy)
     }
 
     func engineDidRequestInsecureNavigation(_ engine: EngineController, url: String) {

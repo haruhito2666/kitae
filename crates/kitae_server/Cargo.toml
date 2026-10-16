@@ -1,0 +1,29 @@
+[package]
+name = "kitae_server"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "kitae-server"
+path = "src/main.rs"
+
+[lib]
+name = "kitae_server"
+
+# Tier B3: the headless HTTP API — a single static Rust binary that serves
+# the same verbs over HTTP, for clients that speak HTTP rather than MCP.
+#
+# No HTTP framework: this workspace hand-rolls its transports (and ships no
+# serde), and the server needs exactly one request shape — a method, a path,
+# a JSON body — so the parser is here, auditable in one file.
+#
+# kitae_mcp is a dependency on purpose: the name→verb mapping (`verb_for`)
+# and the tool inventory are *shared* with the MCP transport, so the two
+# cannot drift into disagreeing about what `watch` takes.
+[dependencies]
+kitae_agent = { path = "../kitae_agent" }
+kitae_core = { path = "../kitae_core" }
+kitae_headless = { path = "../kitae_headless" }
+kitae_json = { path = "../kitae_json" }
+kitae_mcp = { path = "../kitae_mcp" }

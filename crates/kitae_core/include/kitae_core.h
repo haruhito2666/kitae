@@ -308,6 +308,43 @@ enum {
                                  * (light, reduce-motion, normal contrast)
                                  * whatever the screen is set to. Host side:
                                  * print that frame, then send a = 0. */
+    KITAE_CMD_SET_PAGE_JS = 53, /* a = 1 enable, 0 disable page JavaScript
+                                 * (SCRIPTING_DECISION.md). Off by default;
+                                 * applies from the next navigation. Engine
+                                 * builds without page-js reject it silently. */
+    /* ── B4: the agent plane (agentic browser) ────────────────────────────
+     * The app runs the *same* verbs kitae_mcp and kitae_server run, on the
+     * browser it is already showing. Every agent command answers later on the
+     * notifications queue (the engine thread cannot return a value here):
+     *
+     *   KITAE_CMD_AGENT_ACT     -> "agent-result\t{json}"
+     *   KITAE_CMD_AGENT_JOURNAL -> "agent-journal\t{json}" then
+     *                              "agent-policy\t{json}"
+     *   KITAE_CMD_AGENT_GRANT / _REVOKE_GRANTS / _DECLARE
+     *                           -> "agent-policy\t{json}"
+     *
+     * The result JSON is `{ok, verb, result, journal:[…]}` on success and
+     * `{ok:false, verb, kind, message, pending}` on failure, where `kind` is
+     * "argument", "act" or "permission". `pending:true` is the host's cue to
+     * ask the user: send KITAE_CMD_AGENT_GRANT with the verb name (or "*"),
+     * then re-issue the same AGENT_ACT — the grant outranks the session's
+     * read-only default and the act completes. `journal` carries the rows
+     * that act added (verb, request, denied, outcome, elapsedMs).
+     *
+     * Size the buffer from kitae_engine_notification_available(): a result
+     * can be large (an inline screenshot is base64), and take_notification
+     * drops a message that does not fit. Ask for `path` on screenshots and
+     * pdfs when the host wants files instead. */
+    KITAE_CMD_AGENT_ACT = 54, /* url = the verb's JSON, e.g.
+                               * {"verb":"click","target":{"selector":"#go"}}
+                               * — see kitae_agent's Verb::to_json for the
+                               * whole vocabulary */
+    KITAE_CMD_AGENT_JOURNAL = 55, /* reply: the whole activity journal */
+    KITAE_CMD_AGENT_GRANT = 56,   /* url = verb name, or "*" for everything */
+    KITAE_CMD_AGENT_REVOKE_GRANTS = 57, /* forget every grant (new origin,
+                                         * "reset permissions") */
+    KITAE_CMD_AGENT_DECLARE = 58, /* url = verb names a script declared,
+                                   * separated by commas/spaces/newlines */
     KITAE_CMD_SET_MARKED_TEXT = KITAE_CMD_COMPOSITION_UPDATE,
     KITAE_CMD_COMMIT_COMPOSITION = KITAE_CMD_COMPOSITION_COMMIT,
     KITAE_CMD_CANCEL_COMPOSITION = KITAE_CMD_COMPOSITION_CANCEL,
@@ -341,6 +378,29 @@ KitaeEngine *kitae_engine_new(int viewport_w, int viewport_h,
 /* Shut the engine down; the thread finishes any in-flight fetch first. */
 void kitae_engine_destroy(KitaeEngine *engine);
 
+/* B4: install the host's page rasterizer for the agent's `screenshot` and
+ * `pdf` verbs. Until one is installed those verbs answer with the reason
+ * ("no page rasterizer is installed…") rather than a blank image.
+ *
+ * The app does not call this directly: it links kitae_headless and calls
+ * `kitae_headless_install_raster()` (see kitae_headless.h), which builds the
+ * pure-Rust rasterizer and passes the pointers below. A host with its own
+ * painter may call it itself.
+ *
+ * Both functions fill a caller-provided buffer and return the full length of
+ * their output (so the engine can ask with a NULL buffer for the size, then
+ * call again); a negative return is an error whose message is the first
+ * `|n|` bytes of the buffer. They are called on the engine thread with
+ * read-only access to the browser, and must be callable from any thread.
+ * `ctx` is opaque to the engine and released through `free_ctx` (may be NULL)
+ * when the engine drops. Returns 1 when the engine accepted it (the reply
+ * "agent-raster\t1" confirms it on the notifications queue). */
+typedef long (*KitaeRasterFn)(void *ctx, const void *browser,
+                             uint8_t *buf, size_t cap);
+void kitae_engine_set_raster(KitaeEngine *engine, void *ctx,
+                             KitaeRasterFn png, KitaeRasterFn pdf,
+                             void (*free_ctx)(void *ctx));
+
 /* Send a command (kinds above). `a`/`b` carry scroll deltas, click points or
  * viewport sizes; `url` carries the navigation target (ignored otherwise).
  * Selection commands use `a` as a character offset, or `a`/`b` as a
@@ -369,10 +429,25 @@ int kitae_engine_loading(KitaeEngine *engine);
  * dropped). The host decides how to open it (NSWorkspace, `open`, …). */
 int kitae_engine_take_external(KitaeEngine *engine, char *buf, size_t cap);
 
-/* Pop one engine notification — currently Save-Page-as-QTSQ outcomes:
- * "1\t{path}" on success, "0\t{message}" on failure. Returns 1 and
- * NUL-terminates into `buf` (4 KiB recommended), 0 when the queue is empty
- * or `buf` is too small (the message is dropped). */
+/* How long the oldest queued notification is, without consuming it: 1 (with
+ * the length, excluding the NUL, written to *out_len) when one is queued, 0
+ * when the queue is empty. Size the buffer from this before calling
+ * kitae_engine_take_notification — that call cannot put an oversized message
+ * back, and agent results can be large. */
+int kitae_engine_notification_available(KitaeEngine *engine, size_t *out_len);
+
+/* Pop one engine notification. Kinds:
+ *   "1\t{path}" / "0\t{message}"  — Save-Page-as-QTSQ outcome
+ *   "crash\t{reason}"             — a panic was caught in the engine thread
+ *   "download\t{id}\t{state}\t{received}\t{total}\t{name}\t{path}"
+ *   "filepick\t{id-or-name}\t{0|1}", "auth\t{scheme}\t{realm}\t{url}"
+ *   "loginform\t{form}\t{user}\t{pass}", "pwsave\t{origin}\t{user}\t{pass}"
+ *   "inspect\t{node}", "inspectinfo\t{lines…}", "insecure\t{url}"
+ *   "live\t{0|1}"
+ *   "agent-result\t{json}", "agent-journal\t{json}",
+ *   "agent-policy\t{json}", "agent-raster\t{1}".
+ * Returns 1 and NUL-terminates into `buf`, 0 when the queue is empty or `buf`
+ * is too small (the message is dropped). */
 int kitae_engine_take_notification(KitaeEngine *engine, char *buf, size_t cap);
 
 /* Registrable domain for address presentation. Returns the NUL-terminated

@@ -1,0 +1,23 @@
+[package]
+name = "kitae_agent"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lib]
+name = "kitae_agent"
+
+# The agent plane's vocabulary: the verb inventory, its JSON wire forms and
+# the permission hook. Zero dependencies beyond the wire codec, and no
+# feature gates — this is the one place the verbs are named, so it must be
+# linkable by everything that speaks them:
+#
+# - `kitae_script::agent` installs it as *page-facing JS* (page-js only);
+# - `kitae_core::agent` gives it *meaning* against a real `Browser`
+#   (headless CLI, MCP server, HTTP server, the app through FFI).
+#
+# Keeping the vocabulary out of kitae_script is what lets a headless server
+# answer `click` without linking QuickJS: the shape of an act is not a
+# scripting concern.
+[dependencies]
+kitae_json = { path = "../kitae_json" }

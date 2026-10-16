@@ -292,6 +292,7 @@ impl Clone for Engine {
 pub struct EngineBuilder {
     viewport: (f32, f32),
     start_url: String,
+    page_js: bool,
 }
 
 impl Engine {
@@ -300,6 +301,7 @@ impl Engine {
         EngineBuilder {
             viewport: (800.0, 600.0),
             start_url: START_URL.to_string(),
+            page_js: false,
         }
     }
 
@@ -653,6 +655,14 @@ impl EngineBuilder {
         self
     }
 
+    /// SCRIPTING_DECISION.md: enable page JavaScript (feature `page-js`).
+    /// Off by default; only built engines with the feature can execute
+    /// page scripts at all.
+    pub fn page_js(mut self, on: bool) -> Self {
+        self.page_js = on;
+        self
+    }
+
     /// Spawn the engine thread. The thread navigates to the start URL
     /// immediately; `wait_for_frame`/`take_frame` will see it shortly.
     pub fn build(self) -> Engine {
@@ -672,14 +682,37 @@ impl EngineBuilder {
         let host = MailboxHost {
             shared: shared.clone(),
         };
-        let browser = SendBrowser(Browser::new(Box::new(host), measurer, self.viewport));
+        let mut inner = Browser::new(Box::new(host), measurer, self.viewport);
+        // Phase 0: the facade is a product host — top-level http(s) loads
+        // ride the shared fetch pool and finish on the loop's idle tick
+        // below. Local schemes (about:, file:, data:) still load inline,
+        // and so do POST submits.
+        inner.set_background_fetch(true);
+        inner.set_page_js(self.page_js);
+        let browser = SendBrowser(inner);
         let start = self.start_url;
         std::thread::Builder::new()
             .name("kitae-engine".into())
             .spawn(move || {
                 let mut browser = browser;
                 browser.0.navigate(&start);
-                while let Ok(cmd) = rx.recv() {
+                loop {
+                    // The facade's idle tick, mirroring the C-ABI engine:
+                    // wake regularly so pooled loads apply, transitions
+                    // advance and downloads narrate even when no command
+                    // arrives. A 2 ms idle tick costs nothing.
+                    let cmd = match rx.recv_timeout(Duration::from_millis(2)) {
+                        Ok(cmd) => cmd,
+                        Err(mpsc::RecvTimeoutError::Timeout) => {
+                            let b = &mut browser.0;
+                            b.poll_fetches();
+                            b.poll_page_js();
+                            b.tick_transitions();
+                            b.poll_downloads();
+                            continue;
+                        }
+                        Err(mpsc::RecvTimeoutError::Disconnected) => break,
+                    };
                     match cmd {
                         Command::Navigate(url) => browser.0.navigate(&url),
                         Command::Back => browser.0.go(-1),
@@ -821,9 +854,24 @@ mod tests {
         assert_eq!(engine.navigate("   "), Err(EngineError::EmptyUrl));
         assert_eq!(engine.navigate(""), Err(EngineError::EmptyUrl));
         // The rejected navigation must not have produced frames or events.
-        std::thread::sleep(Duration::from_millis(60));
-        assert!(engine.take_frame().is_none());
-        assert!(engine.poll_events().is_empty());
+        // Boot events race the rejection under parallel-suite scheduling,
+        // so require a demonstrable quiescence window: no events and no
+        // frames across two drains a beat apart. Anything the rejection
+        // produced would keep the stream busy past the deadline.
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        loop {
+            let quiet = engine.poll_events().is_empty() && engine.take_frame().is_none();
+            if quiet {
+                std::thread::sleep(Duration::from_millis(100));
+                if engine.poll_events().is_empty() && engine.take_frame().is_none() {
+                    break;
+                }
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "event stream never went quiet after the rejected navigation"
+            );
+        }
         assert!(!engine.is_loading());
     }
 
@@ -993,6 +1041,44 @@ mod tests {
         assert!(
             wide.display_list.content_height <= narrow.display_list.content_height,
             "wider viewport must not make the document taller ({wide:?} vs {narrow:?})"
+        );
+    }
+
+    /// SCRIPTING_DECISION.md: the facade's page-js opt-in — builder flag
+    /// to script-phase to republished frame, drained on the loop tick.
+    #[cfg(feature = "page-js")]
+    #[test]
+    fn page_js_builder_runs_scripts_and_publishes() {
+        let engine = Engine::builder()
+            .viewport(400.0, 600.0)
+            .start_url("about:blank")
+            .page_js(true)
+            .build();
+        engine
+            .wait_for_frame(Duration::from_secs(5))
+            .expect("blank frame");
+        engine.load_html(
+            "<html><body><p id=\"x\"></p><script>\
+             document.getElementById('x').textContent = 'facade words';\
+             </script></body></html>",
+            "https://example.test/facade",
+        );
+        // load_html processes + publishes on the engine thread; the next
+        // frame after the boot frame is the scripted page.
+        let frame = engine
+            .wait_for_frame(Duration::from_secs(5))
+            .expect("scripted page frame");
+        let text = frame
+            .display_list
+            .texts
+            .iter()
+            .map(|t| t.text.as_str())
+            .collect::<Vec<_>>()
+            .join(" ");
+        assert!(
+            text.contains("facade words"),
+            "scripted content reaches the frame: {text:?}; url: {}",
+            frame.url
         );
     }
 

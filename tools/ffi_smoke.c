@@ -7,6 +7,8 @@
 #include <string.h>
 #include <unistd.h>
 #include "kitae_core.h"
+/* B4: the rasterizer installer the app calls (it links the same static lib). */
+#include "kitae_headless.h"
 
 static int fail = 0;
 
@@ -65,6 +67,57 @@ int main(void) {
         if (version != KITAE_FRAME_VERSION) fail = 1;
     }
     printf("loading: %d\n", kitae_engine_loading(e));
+
+    /* B4: the agent plane, exactly as the app drives it — install the
+     * rasterizer, run a read verb, then a write verb that must ask first. */
+    if (!kitae_headless_install_raster(e, 1.0)) {
+        puts("no system fonts — skipping the agent checks");
+        kitae_engine_destroy(e);
+        puts(fail ? "FAIL" : "OK");
+        return fail;
+    }
+    kitae_engine_command(e, KITAE_CMD_AGENT_ACT, 0, 0, "{\"verb\":\"read\"}");
+    /* 1 MiB: an inline screenshot's base64 is far bigger than a 4 KiB
+     * notification, and take_notification leaves an oversized (or
+     * unsized-for) message queued rather than dropping it. */
+    static char note[1 << 20];
+    int saw_read = 0, saw_pending = 0, saw_shot = 0;
+    for (int i = 0; i < 200 && (!saw_read || !saw_pending || !saw_shot); i++) {
+        size_t len = 0;
+        if (kitae_engine_notification_available(e, &len) == 1 && len + 1 < sizeof note) {
+            if (kitae_engine_take_notification(e, note, sizeof note) == 1) {
+                if (!strncmp(note, "agent-result\t", 13)) {
+                    if (strstr(note, "\"verb\":\"read\"") && strstr(note, "\"ok\":true"))
+                        saw_read = 1;
+                    if (strstr(note, "\"kind\":\"permission\""))
+                        saw_pending = 1;
+                }
+                continue;
+            }
+        }
+        /* read → navigate (must ask) → screenshot (read-only, needs the
+         * rasterizer that was just installed). */
+        if (saw_read && !saw_pending)
+            kitae_engine_command(e, KITAE_CMD_AGENT_ACT, 0, 0,
+                                 "{\"verb\":\"navigate\",\"url\":\"about:blank\"}");
+        if (saw_read && saw_pending && !saw_shot)
+            kitae_engine_command(e, KITAE_CMD_AGENT_ACT, 0, 0, "{\"verb\":\"screenshot\"}");
+        usleep(20000);
+    }
+    /* …and the screenshot's own reply, which carries PNG bytes in base64. */
+    for (int i = 0; i < 200 && !saw_shot; i++) {
+        size_t len = 0;
+        if (kitae_engine_notification_available(e, &len) == 1 && len + 1 < sizeof note
+            && kitae_engine_take_notification(e, note, sizeof note) == 1
+            && strstr(note, "\"mime\":\"image/png\"")) {
+            saw_shot = 1;
+            break;
+        }
+        usleep(20000);
+    }
+    printf("agent read=%d pending=%d screenshot=%d\n", saw_read, saw_pending, saw_shot);
+    if (!saw_read || !saw_pending || !saw_shot) fail = 1;
+
     kitae_engine_destroy(e);
     puts(fail ? "FAIL" : "OK");
     return fail;

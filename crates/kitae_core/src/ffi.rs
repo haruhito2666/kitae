@@ -27,6 +27,7 @@ use kitae_layout::{DisplayList, ResolvedClip, TextMeasurer};
 use kitae_net::resolve;
 use kitae_style::{ColorScheme, EnvironmentState, FilterFn, FilterList, MediaType};
 
+use crate::agent::{self, HostRaster, PageRasterVtable, SessionState};
 use crate::{Browser, PublicState, START_URL};
 
 const FRAME_VERSION: u32 = 20;
@@ -73,6 +74,8 @@ enum Command {
     SetPreferences(EnvironmentState),
     /// H3: the media environment the page is laid out in (screen / print).
     SetMediaType(MediaType),
+    /// SCRIPTING_DECISION.md: enable/disable page JavaScript (next load).
+    SetPageJs(bool),
     /// Save the current page as a device-encrypted QTSQ archive at `url`.
     /// The outcome arrives later on the notifications queue.
     SavePage(String),
@@ -127,7 +130,44 @@ enum Command {
     },
     SetSearchProvider(u8),
     ResolveInsecureNavigation(bool),
+    /// B4: install the host's rasterizer (the app links kitae_headless and
+    /// hands over its vtable; see [`PageRasterVtable`]).
+    SetRaster(SendRaster),
+    /// B4: run one verb, given as its wire JSON, on this engine's browser.
+    /// The answer arrives on the notifications queue as `agent-result`.
+    AgentAct(String),
+    /// B4: reply with the whole activity journal as `agent-journal`.
+    AgentJournal,
+    /// B4: the user approved `name` for this session (`*` = everything).
+    AgentGrant(String),
+    /// B4: forget every grant.
+    AgentRevokeGrants,
+    /// B4: a script declared these verbs — comma/space separated names.
+    AgentDeclare(String),
 }
+
+impl Command {
+    /// The commands that need the agent state beside the browser.
+    fn is_agent(&self) -> bool {
+        matches!(
+            self,
+            Command::SetRaster(_)
+                | Command::AgentAct(_)
+                | Command::AgentJournal
+                | Command::AgentGrant(_)
+                | Command::AgentRevokeGrants
+                | Command::AgentDeclare(_)
+        )
+    }
+}
+
+/// A [`PageRasterVtable`] on its way to the engine thread. The function
+/// pointers themselves carry no thread affinity — the host contract is that
+/// they may be called from the engine thread — so the wrapper only says what
+/// the vtable's own documentation already requires.
+struct SendRaster(PageRasterVtable);
+
+unsafe impl Send for SendRaster {}
 
 pub struct Engine {
     tx: mpsc::Sender<Command>,
@@ -164,7 +204,12 @@ impl Engine {
             notifications: notifications.clone(),
         };
         let measurer = CbMeasurer { vt };
-        let browser = Browser::new(Box::new(host), Box::new(measurer), (width, height));
+        let mut browser = Browser::new(Box::new(host), Box::new(measurer), (width, height));
+        // Phase 0: the app drives loads through a UI that keeps polling,
+        // so top-level http(s) loads ride the shared fetch pool and
+        // finish on the idle tick below. Local schemes (about:, file:,
+        // data:) still load inline, and so do POST submits.
+        browser.set_background_fetch(true);
 
         // Wrap before the closure. The `use` defeats edition-2021 disjoint
         // capture (which would otherwise capture `browser.0`, a non-Send
@@ -174,6 +219,8 @@ impl Engine {
         // S-5 (SECURITY_AUDIT.md): the panic guard reports through the same
         // notifications queue the host already drains.
         let crash_notes = notifications.clone();
+        // B4: the agent commands answer on that queue too.
+        let agent_notes = notifications.clone();
         // The engine thread answers LiveState through this queue (the host
         // keeps its own Arc — the same one).
         #[cfg(feature = "live")]
@@ -182,6 +229,10 @@ impl Engine {
             .name("kitae-engine".into())
             .spawn(move || {
                 let mut browser = browser;
+                // B4: the agent plane's state for this engine — the policy,
+                // journal and rasterizer. The app drives the *same* verbs the
+                // servers do, over the browser that paints its window.
+                let mut agent = SessionState::new();
                 // S-5/H8: even the startup navigation is guarded — a panic
                 // before the loop would leave a dead tab with no page.
                 run_protected(&crash_notes, "startup", &mut browser.0, |b| {
@@ -207,15 +258,42 @@ impl Engine {
                                 // H1: push download-registry changes to the
                                 // host (progress coalesced to ~100 ms).
                                 b.poll_downloads();
+                                // Phase 0: apply completed background (pooled)
+                                // top-level loads. `load` returned right after
+                                // submitting; the pipeline replays here.
+                                b.poll_fetches();
+                                // SCRIPTING_DECISION.md: page event loop —
+                                // timers, fetch settle, queued navigations.
+                                b.poll_page_js();
                             });
                             continue;
                         }
                         Err(mpsc::RecvTimeoutError::Disconnected) => break,
                     };
+                    // B4: the agent commands need the session state beside
+                    // the browser, so they take the guard that has both.
+                    if cmd.is_agent() {
+                        let notes = agent_notes.clone();
+                        run_agent_guarded(
+                            &crash_notes,
+                            "agent command",
+                            &mut browser.0,
+                            &mut agent,
+                            |b, state| handle_agent_command(cmd, &notes, b, state),
+                        );
+                        continue;
+                    }
                     // S-5: every command runs behind the panic guard — a
                     // crash costs one notification plus a crash page, not
                     // the tab.
                     run_protected(&crash_notes, "command", &mut browser.0, |b| match cmd {
+                        // B4: handled above, where the agent state is in reach.
+                        Command::SetRaster(_)
+                        | Command::AgentAct(_)
+                        | Command::AgentJournal
+                        | Command::AgentGrant(_)
+                        | Command::AgentRevokeGrants
+                        | Command::AgentDeclare(_) => {}
                         Command::Navigate(url) => b.navigate(&url),
                         Command::Back => b.go(-1),
                         Command::Forward => b.go(1),
@@ -274,6 +352,9 @@ impl Engine {
                         }
                         Command::SetMediaType(media) => {
                             b.set_media_type(media);
+                        }
+                        Command::SetPageJs(on) => {
+                            b.set_page_js(on);
                         }
                         Command::SavePage(path) => {
                             // Outcomes reach the embedder via the
@@ -429,6 +510,94 @@ fn run_protected(
         let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             browser.show_crash_page(what);
         }));
+    }
+}
+
+/// The [`run_protected`] guard for commands that also touch the agent state:
+/// a panic inside a verb costs one notification and a crash page, not the
+/// tab, and the state stays usable because the borrow ends with the closure.
+fn run_agent_guarded(
+    notes: &Arc<Mutex<VecDeque<String>>>,
+    what: &str,
+    browser: &mut Browser,
+    state: &mut SessionState,
+    body: impl FnOnce(&mut Browser, &mut SessionState),
+) {
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| body(browser, state)));
+    if result.is_err() {
+        eprintln!("kitae_core: recovered from a panic in the engine {what}");
+        lock_poison_ok(notes).push_back(format!("crash\tpanic recovered in the engine {what}"));
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            browser.show_crash_page(what);
+        }));
+    }
+}
+
+/// B4: the agent's commands, run on the engine thread. Every answer goes out
+/// on the notifications queue — the C ABI cannot return a value to the caller
+/// that sent the command, and the app is polling that queue anyway.
+fn handle_agent_command(
+    cmd: Command,
+    notes: &Arc<Mutex<VecDeque<String>>>,
+    browser: &mut Browser,
+    state: &mut SessionState,
+) {
+    let push = |message: String| lock_poison_ok(notes).push_back(message);
+    match cmd {
+        Command::SetRaster(vt) => {
+            // Safety: the vtable contract in `kitae_core.h` — both functions
+            // are callable from this thread with a read-only browser, and the
+            // context stays valid until `free` runs.
+            state.set_raster(std::sync::Arc::new(unsafe { HostRaster::new(vt.0) }));
+            push("agent-raster\t1".to_string());
+        }
+        Command::AgentAct(request) => {
+            let last = state.journal().last().map(|row| row.seq).unwrap_or(0);
+            let reply = agent::run_wire(state, browser, &request);
+            let rows: Vec<agent::JournalRow> = state
+                .journal()
+                .iter()
+                .filter(|row| row.seq > last)
+                .cloned()
+                .collect();
+            // The reply carries the rows *this* act added, so the activity
+            // panel updates from the answer it is already receiving; opening
+            // the panel asks for the whole journal separately.
+            let reply = match kitae_json::parse(&reply) {
+                Ok(kitae_json::Value::Obj(mut pairs)) => {
+                    pairs.push(("journal".to_string(), agent::journal_json(&rows)));
+                    kitae_json::Value::Obj(pairs).to_json()
+                }
+                _ => reply,
+            };
+            push(format!("agent-result\t{reply}"));
+        }
+        Command::AgentJournal => {
+            push(format!(
+                "agent-journal\t{}",
+                agent::journal_json(state.journal()).to_json()
+            ));
+            push(format!("agent-policy\t{}", state.policy_json().to_json()));
+        }
+        Command::AgentGrant(name) => {
+            state.grant(&name);
+            push(format!("agent-policy\t{}", state.policy_json().to_json()));
+        }
+        Command::AgentRevokeGrants => {
+            state.revoke_grants();
+            push(format!("agent-policy\t{}", state.policy_json().to_json()));
+        }
+        Command::AgentDeclare(list) => {
+            let verbs: Vec<String> = list
+                .split([',', ' ', '\n', '\t'])
+                .map(str::trim)
+                .filter(|name| !name.is_empty())
+                .map(String::from)
+                .collect();
+            state.declare(&verbs);
+            push(format!("agent-policy\t{}", state.policy_json().to_json()));
+        }
+        _ => {}
     }
 }
 
@@ -1228,6 +1397,41 @@ pub struct KitaeMeasurerVtable {
     >,
 }
 
+/// The C shape of a host rasterizer's two functions — see
+/// [`PageRasterVtable`] for the contract they must honour.
+pub type KitaeRasterFn = unsafe extern "C" fn(*mut c_void, *const Browser, *mut u8, usize) -> isize;
+
+/// B4: install the host's page rasterizer. `ctx` is opaque to the engine and
+/// `free_ctx` (may be NULL) releases it when the engine drops; `png` and
+/// `pdf` (either may be NULL) fill a caller-provided buffer.
+///
+/// The app links `kitae_headless` and reaches this through
+/// `kitae_headless_install_raster()`, which is one call with no function
+/// pointers in the host's own code.
+///
+/// # Safety
+/// `ctx` must stay valid until `free_ctx` runs; both functions must be
+/// callable from the engine thread with a read-only browser.
+#[no_mangle]
+pub extern "C" fn kitae_engine_set_raster(
+    engine: *mut Engine,
+    ctx: *mut c_void,
+    png: Option<KitaeRasterFn>,
+    pdf: Option<KitaeRasterFn>,
+    free_ctx: Option<unsafe extern "C" fn(*mut c_void)>,
+) {
+    let Some(engine) = (unsafe { engine.as_ref() }) else {
+        return;
+    };
+    let vt = PageRasterVtable {
+        ctx,
+        png,
+        pdf,
+        free: free_ctx,
+    };
+    let _ = engine.tx.send(Command::SetRaster(SendRaster(vt)));
+}
+
 #[no_mangle]
 pub extern "C" fn kitae_engine_new(
     viewport_w: c_int,
@@ -1322,6 +1526,16 @@ pub const KITAE_CMD_EXTEND_CARET: c_int = 49;
 pub const KITAE_CMD_SELECTION_BEGIN_POINT: c_int = 50;
 pub const KITAE_CMD_SELECTION_EXTEND_POINT: c_int = 51;
 pub const KITAE_CMD_SET_MEDIA: c_int = 52; /* a = media type (0 screen, 1 print) — H3 */
+pub const KITAE_CMD_SET_PAGE_JS: c_int = 53; /* a = 1 enable, 0 disable page JavaScript — SCRIPTING_DECISION.md */
+pub const KITAE_CMD_AGENT_ACT: c_int = 54; /* url = the verb's JSON; the answer
+                                           arrives on the notifications queue
+                                           as "agent-result\t{json}" (B4) */
+pub const KITAE_CMD_AGENT_JOURNAL: c_int = 55; /* reply: "agent-journal\t{json}" +
+                                               "agent-policy\t{json}" (B4) */
+pub const KITAE_CMD_AGENT_GRANT: c_int = 56; /* url = verb name, or "*" — the
+                                             user's answer to a prompt (B4) */
+pub const KITAE_CMD_AGENT_REVOKE_GRANTS: c_int = 57; /* drop every grant (B4) */
+pub const KITAE_CMD_AGENT_DECLARE: c_int = 58; /* url = declared verb names (B4) */
 
 /// Send a command. `a`/`b` carry scroll deltas, click points or viewport
 /// sizes; `url` carries the navigation target (ignored otherwise), except:
@@ -1401,6 +1615,7 @@ fn parse_command(
             contrast_more: (b as i32 & 2) != 0,
             ..EnvironmentState::default()
         }),
+        KITAE_CMD_SET_PAGE_JS => Command::SetPageJs(a >= 0.5),
         KITAE_CMD_SET_MEDIA => Command::SetMediaType(if a >= 0.5 {
             MediaType::Print
         } else {
@@ -1476,6 +1691,13 @@ fn parse_command(
             Command::SetSearchProvider(if a < 0.0 { 0 } else { a as u8 })
         }
         KITAE_CMD_RESOLVE_INSECURE_NAVIGATION => Command::ResolveInsecureNavigation(a >= 0.5),
+        // B4: the agent plane. `AgentAct` carries the verb's wire JSON, so a
+        // host needs no new command per verb.
+        KITAE_CMD_AGENT_ACT => Command::AgentAct(read_cstr(url)),
+        KITAE_CMD_AGENT_JOURNAL => Command::AgentJournal,
+        KITAE_CMD_AGENT_GRANT => Command::AgentGrant(read_cstr(url)),
+        KITAE_CMD_AGENT_REVOKE_GRANTS => Command::AgentRevokeGrants,
+        KITAE_CMD_AGENT_DECLARE => Command::AgentDeclare(read_cstr(url)),
         _ => return None,
     })
 }
@@ -1582,6 +1804,35 @@ pub extern "C" fn kitae_engine_take_external(
 /// `"1\t{path}"` on success, `"0\t{message}"` on failure. Returns 1 and
 /// NUL-terminates into `buf` (≥ 4 KiB recommended), 0 when the queue is
 /// empty or `buf` is too small (the message is dropped).
+/// How long the oldest queued notification is, without consuming it: 1 when
+/// one is queued (with its length written to `out_len`, excluding the NUL),
+/// 0 when the queue is empty. A host must size its buffer from this —
+/// `kitae_engine_take_notification` cannot put an oversized message back, and
+/// an agent result (a screenshot's base64, a journal dump) can be large.
+#[no_mangle]
+pub extern "C" fn kitae_engine_notification_available(
+    engine: *mut Engine,
+    out_len: *mut usize,
+) -> c_int {
+    ffi_catch(|| {
+        let Some(engine) = (unsafe { engine.as_ref() }) else {
+            return 0;
+        };
+        let queue = engine
+            .notifications
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let Some(msg) = queue.front() else {
+            return 0;
+        };
+        if !out_len.is_null() {
+            unsafe { *out_len = msg.len() };
+        }
+        1
+    })
+    .unwrap_or(0)
+}
+
 #[no_mangle]
 pub extern "C" fn kitae_engine_take_notification(
     engine: *mut Engine,
@@ -2792,23 +3043,38 @@ mod tests {
     }
 
     fn wait_for_frame_inner(engine: &Engine) -> Vec<u8> {
-        let len = kitae_engine_frame(
-            engine as *const Engine as *mut Engine,
-            std::ptr::null_mut(),
-            0,
-        );
-        if len > 0 {
-            let mut buf = vec![0u8; len];
-            let got = kitae_engine_frame(
+        loop {
+            let len = kitae_engine_frame(
                 engine as *const Engine as *mut Engine,
-                buf.as_mut_ptr(),
-                buf.len(),
+                std::ptr::null_mut(),
+                0,
             );
-            assert_eq!(got, len, "frame consumed on the second call");
-            return buf;
+            if len > 0 {
+                let mut buf = vec![0u8; len];
+                let got = kitae_engine_frame(
+                    engine as *const Engine as *mut Engine,
+                    buf.as_mut_ptr(),
+                    buf.len(),
+                );
+                if got > 0 {
+                    // `got` is the frame's current size at consume time:
+                    // either the probed frame (got == len) or a newer,
+                    // smaller one that was published between the probe and
+                    // the consume — fully written (got < len). A larger
+                    // replacement refuses the undersized buffer, consumes
+                    // nothing and reports its own size (got > len), so a
+                    // bigger allocation tries again.
+                    if got <= len {
+                        buf.truncate(got);
+                        return buf;
+                    }
+                    continue;
+                }
+                // got == 0 after a nonzero probe: the mailbox emptied
+                // between the calls — keep polling.
+            }
+            std::thread::sleep(std::time::Duration::from_millis(25));
         }
-        std::thread::sleep(std::time::Duration::from_millis(25));
-        Vec::new()
     }
 
     #[test]
@@ -4647,5 +4913,214 @@ mod tests {
             7,
             "a panicking holder must not take the mailbox down with it"
         );
+    }
+
+    // ── B4: the agent plane on the app's own engine ───────────────────────
+
+    /// Pop queued notifications until one of `prefix` arrives (dropping the
+    /// rest, exactly as a host that only handles the kinds it knows does).
+    fn wait_for_notification(engine: &Engine, prefix: &str) -> Option<String> {
+        wait_for_notification_where(engine, prefix, "")
+    }
+
+    /// The same, but only a message that also contains `needle` — several
+    /// policy snapshots can be queued, and a test that stops at the first one
+    /// reads a stale answer.
+    fn wait_for_notification_where(engine: &Engine, prefix: &str, needle: &str) -> Option<String> {
+        for _ in 0..600 {
+            let mut len = 0usize;
+            let queued = kitae_engine_notification_available(
+                engine as *const Engine as *mut Engine,
+                &mut len,
+            );
+            if queued == 1 {
+                // Size from the peek: `take_notification` drops an oversized
+                // message rather than putting it back.
+                let mut buf = vec![0 as c_char; len + 1];
+                let got = kitae_engine_take_notification(
+                    engine as *const Engine as *mut Engine,
+                    buf.as_mut_ptr(),
+                    buf.len(),
+                );
+                if got == 1 {
+                    let message = unsafe { CStr::from_ptr(buf.as_ptr()) }
+                        .to_string_lossy()
+                        .into_owned();
+                    if let Some(rest) = message.strip_prefix(prefix) {
+                        if rest.contains(needle) {
+                            return Some(rest.to_string());
+                        }
+                    }
+                }
+                continue;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        None
+    }
+
+    fn test_engine(width: c_int, height: c_int) -> *mut Engine {
+        let vt = KitaeMeasurerVtable {
+            ctx: std::ptr::null_mut(),
+            measure: test_measure,
+            metrics: test_metrics,
+            x_height: None,
+        };
+        kitae_engine_new(width, height, &vt)
+    }
+
+    fn send_agent_act(engine: *mut Engine, request: &str) {
+        let json = CString::new(request).unwrap();
+        kitae_engine_command(engine, KITAE_CMD_AGENT_ACT, 0.0, 0.0, json.as_ptr());
+    }
+
+    /// The two-phase permission flow the app's panel is built on: a verb
+    /// outside the session's rule comes back `pending` (and journaled as a
+    /// refusal), the host asks the user, grants, and the *same* request then
+    /// runs.
+    #[test]
+    fn agent_acts_run_on_the_engines_own_browser_behind_a_permission_prompt() {
+        let engine = test_engine(800, 600);
+        assert!(!engine.is_null());
+        // Let the startup navigation land, so `read` has a page to read.
+        let _ = wait_for_frame(unsafe { &*engine });
+
+        // 1. A read-only verb runs straight away — and the reply carries the
+        //    journal rows this act added.
+        send_agent_act(engine, r#"{"verb":"read"}"#);
+        let reply = wait_for_notification(unsafe { &*engine }, "agent-result\t").expect("reply");
+        assert!(reply.contains(r#""ok":true"#), "{reply}");
+        assert!(reply.contains(r#""verb":"read""#), "{reply}");
+        assert!(
+            reply.contains(r#""journal""#),
+            "the act's journal rows travel with it: {reply}"
+        );
+
+        // 2. `navigate` is not in the default (read-only) policy: the engine
+        //    refuses, names the verb, and marks the reply pending — that is
+        //    what tells a host to prompt instead of giving up.
+        send_agent_act(engine, r#"{"verb":"navigate","url":"about:blank"}"#);
+        let reply = wait_for_notification(unsafe { &*engine }, "agent-result\t").expect("reply");
+        assert!(reply.contains(r#""ok":false"#), "{reply}");
+        assert!(reply.contains(r#""kind":"permission""#), "{reply}");
+        assert!(reply.contains(r#""pending":true"#), "{reply}");
+        assert!(reply.contains(r#""verb":"navigate""#), "{reply}");
+
+        // 3. The user says yes: the host records the grant…
+        let verb = CString::new("navigate").unwrap();
+        kitae_engine_command(engine, KITAE_CMD_AGENT_GRANT, 0.0, 0.0, verb.as_ptr());
+        let policy = wait_for_notification_where(unsafe { &*engine }, "agent-policy\t", "navigate")
+            .expect("policy");
+        assert!(policy.contains(r#""navigate""#), "{policy}");
+
+        // …and the very same request now runs.
+        send_agent_act(engine, r#"{"verb":"navigate","url":"about:blank"}"#);
+        let reply = wait_for_notification(unsafe { &*engine }, "agent-result\t").expect("reply");
+        assert!(reply.contains(r#""ok":true"#), "{reply}");
+        assert!(reply.contains("about:blank"), "{reply}");
+
+        // 4. The journal is the audit the panel renders: the refusal is in it
+        //    (an audit that only records successes is not an audit).
+        kitae_engine_command(engine, KITAE_CMD_AGENT_JOURNAL, 0.0, 0.0, std::ptr::null());
+        let journal =
+            wait_for_notification(unsafe { &*engine }, "agent-journal\t").expect("journal");
+        assert!(journal.contains(r#""denied""#), "{journal}");
+        assert!(journal.contains(r#""verb":"navigate""#), "{journal}");
+        assert!(journal.contains(r#""outcome""#), "{journal}");
+
+        // 5. Revoking forgets the grant: the next attempt prompts again.
+        kitae_engine_command(
+            engine,
+            KITAE_CMD_AGENT_REVOKE_GRANTS,
+            0.0,
+            0.0,
+            std::ptr::null(),
+        );
+        let policy =
+            wait_for_notification_where(unsafe { &*engine }, "agent-policy\t", r#""grants":[]"#)
+                .expect("policy");
+        assert!(policy.contains(r#""grants":[]"#), "{policy}");
+        send_agent_act(engine, r#"{"verb":"navigate","url":"about:blank"}"#);
+        let reply = wait_for_notification(unsafe { &*engine }, "agent-result\t").expect("reply");
+        assert!(reply.contains(r#""pending":true"#), "{reply}");
+
+        kitae_engine_destroy(engine);
+    }
+
+    // The host rasterizer the app installs, faked: it reads the browser it is
+    // handed (proving the pointer is the live one) and answers with bytes a
+    // test can recognise.
+    static RASTER_CALLS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+    static RASTER_SAW: Mutex<Option<String>> = Mutex::new(None);
+
+    unsafe extern "C" fn fake_raster_png(
+        _ctx: *mut c_void,
+        browser: *const Browser,
+        buf: *mut u8,
+        cap: usize,
+    ) -> isize {
+        RASTER_CALLS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let Some(browser) = browser.as_ref() else {
+            return -1;
+        };
+        let url = browser.state().url;
+        *lock_poison_ok(&RASTER_SAW) = Some(url.clone());
+        let bytes = format!("PNGOF {url}").into_bytes();
+        if !buf.is_null() && cap > 0 {
+            let n = bytes.len().min(cap);
+            std::ptr::copy_nonoverlapping(bytes.as_ptr(), buf, n);
+        }
+        bytes.len() as isize
+    }
+
+    /// `screenshot` on the app's engine: the host installs a rasterizer
+    /// through the C ABI, and the verb reaches it with the engine's own
+    /// browser — the whole point of the vtable.
+    #[test]
+    fn a_host_rasterizer_serves_screenshot_on_the_engines_browser() {
+        let engine = test_engine(400, 300);
+        assert!(!engine.is_null());
+        let _ = wait_for_frame(unsafe { &*engine });
+
+        kitae_engine_set_raster(
+            engine,
+            std::ptr::null_mut(),
+            Some(fake_raster_png),
+            None,
+            None,
+        );
+        assert!(
+            wait_for_notification(unsafe { &*engine }, "agent-raster\t").is_some(),
+            "the engine confirms the rasterizer is installed"
+        );
+
+        send_agent_act(engine, r#"{"verb":"screenshot"}"#);
+        let reply = wait_for_notification(unsafe { &*engine }, "agent-result\t").expect("reply");
+        assert!(reply.contains(r#""ok":true"#), "{reply}");
+        assert!(reply.contains(r#""mime":"image/png""#), "{reply}");
+        // The bytes are the fake's, carried as base64 of "PNGOF <url>" — so
+        // the verb, the reply and the browser pointer all line up.
+        let seen = lock_poison_ok(&RASTER_SAW).clone().unwrap_or_default();
+        assert!(
+            !seen.is_empty(),
+            "the rasterizer saw the engine's live browser (url {seen:?})"
+        );
+        let expected = crate::b64_encode(format!("PNGOF {seen}").as_bytes());
+        assert!(
+            reply.contains(&expected),
+            "the reply carries the rasterizer's bytes for {seen:?}"
+        );
+        assert!(
+            RASTER_CALLS.load(std::sync::atomic::Ordering::SeqCst) >= 2,
+            "two-pass sizing"
+        );
+
+        // `pdf` had no function pointer installed, and says so by name.
+        send_agent_act(engine, r#"{"verb":"pdf"}"#);
+        let reply = wait_for_notification(unsafe { &*engine }, "agent-result\t").expect("reply");
+        assert!(reply.contains(r#""ok":false"#), "{reply}");
+        assert!(reply.contains("no rasterizer for `pdf`"), "{reply}");
+
+        kitae_engine_destroy(engine);
     }
 }

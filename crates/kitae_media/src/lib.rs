@@ -197,6 +197,25 @@ fn is_svg_text(bytes: &[u8]) -> bool {
     head.windows(4).any(|w| w == *b"<svg")
 }
 
+/// Encode an RGBA8 raster as a PNG (8-bit RGBA, no interlace). The
+/// canvas `toDataURL` path needs an encoder next to the decoders: a page
+/// can hand the result straight back to the engine as an image source.
+pub fn encode_png(img: &RgbaImage) -> Result<Vec<u8>, MediaError> {
+    let mut out = Vec::new();
+    {
+        let mut encoder = png::Encoder::new(&mut out, img.width, img.height);
+        encoder.set_color(png::ColorType::Rgba);
+        encoder.set_depth(png::BitDepth::Eight);
+        let mut writer = encoder
+            .write_header()
+            .map_err(|e| MediaError::Decode(format!("png header: {e}")))?;
+        writer
+            .write_image_data(&img.pixels)
+            .map_err(|e| MediaError::Decode(format!("png encode: {e}")))?;
+    }
+    Ok(out)
+}
+
 /// Decode PNG bytes → RGBA8 (any color type / bit depth the `png` crate
 /// accepts, expanded to 8-bit RGBA; interlace handled by the crate).
 pub fn decode_png(bytes: &[u8]) -> Result<RgbaImage, MediaError> {

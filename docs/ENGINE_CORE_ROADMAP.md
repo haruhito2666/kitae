@@ -1,5 +1,12 @@
 # Kitae Engine Core — Full Completion Roadmap
 
+> **Superseded in ordering, 2026-10-15:** the owner pivot
+> (`AGENTIC_PIVOT.md`) makes the standard-JS/agentic program the current
+> focus — see `ROADMAP.md` §The current plan (Tracks A–E). The
+> engine-completion items below remain valid engineering targets, taken
+> opportunistically where the Track-A conformance panel demands them;
+> first-vision engine phases get no new standalone starts.
+>
 > Status: PLANNING. Written 2026-09-03, after the engine-core goal (slices A–I)
 > verified complete — see `ENGINE_CORE_STATUS.md` for what exists today
 > (152 tests green, DisplayList v2, FFI frame v3).

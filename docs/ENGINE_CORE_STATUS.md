@@ -1,6 +1,204 @@
 # Kitae Engine Core — Status Document
 
-_What the engine core contains today, and exactly how much is left. Last refreshed: 2026-09-26._
+_What the engine core contains today, and exactly how much is left. Last refreshed: 2026-10-16._
+
+> **2026-10-16 — tiers JS-4/JS-5/JS-6 land: the Track-A ladder's feature
+> work is complete** (inventory and the recorded gaps in
+> `SCRIPTING_DECISION.md`; the measured conformance spine in
+> `WPT_SCORECARD.md`). **JS-4 observers:** `MutationObserver` (records
+> journaled by the DOM wrappers — attributes, characterData, childList,
+> with `subtree`/`attributeFilter`/old-value flags — delivered on the
+> microtask queue with the engine tick as the safety net),
+> `IntersectionObserver` (threshold crossings against the published
+> display-list geometry and scroll state), `ResizeObserver` (content-box
+> sizes from the same publish). **JS-5 glue:** async `XMLHttpRequest`
+> over the same fetch pool `fetch` uses (custom headers/bodies take the
+> pool's Raw path; sync XHR refused by design) and `Worker` as a
+> documented same-thread emulation (pool-fetched script evaluated with
+> `self`/`postMessage`/`addEventListener` bound to a port, messages
+> `structuredClone`d, `terminate()` stops delivery — no real
+> parallelism). **JS-6 truth:** spec-shaped `Storage` for
+> `localStorage`/`sessionStorage` (methods + Proxy named properties;
+> `localStorage` process-wide per origin and in-memory, `sessionStorage`
+> scoped per `Browser` and surviving navigation inside it, opaque origins
+> throw `SecurityError`) and a software canvas 2D context (paths with
+> both fill rules, rects, arcs, curves, the affine transform set with
+> save/restore/globalAlpha, `getImageData`/`putImageData`, `drawImage`
+> from canvas/`ImageData`/`<img>`, `toDataURL()` → PNG encoded by
+> `kitae_media`). Engine-side changes this tier pulled in: the UA sheet
+> no longer hides `<canvas>` (it is a replaced element now), layout emits
+> `\0canvas:{node}` sentinels whose registered raster the publish pass
+> stamps on every relayout, and `ensure_web_raster` decodes PNG/JPEG/GIF/
+> WebP `data:` URLs (which is what makes `toDataURL` output usable as an
+> image source). Suite: kitae_core page-js 46/46 (271 total with the
+> feature, 224 without), WPT page-JS subset re-measured at 1213/1349
+> (89.9%, unchanged — the harness now skips visibly instead of failing
+> when the `page-js` feature is off), and the full workspace sweep is
+> green (55 suites, 1171 passed, 0 failed, 3 ignored). The ladder's one remaining exit — page-JS default-on for
+> library builds — is an owner gate: the app already runs the tier on
+> every tab and `crates/kitae_core/Cargo.toml` records the flip.
+
+> **2026-10-15 — tier JS-3: the standard constructor set and read paths
+> land** (Track A's first step under the agentic pivot; inventory amended
+> in `SCRIPTING_DECISION.md`). `Event`/`CustomEvent`/`MouseEvent`/
+> `KeyboardEvent` constructors + `dispatchEvent`; `AbortController`/
+> `AbortSignal` with `once`/`passive`/`signal` listener options;
+> `URL`/`URLSearchParams` (base-resolved through `kitae_net::resolve`,
+> live `searchParams` linkage); `Headers`/`Request`/`Response` with
+> standard fetch semantics (any HTTP status resolves; transport failure
+> rejects); `FormData` — including `new FormData(form)` and multipart
+> POST bodies riding the pool's uncached Raw path (a recorded-loopback
+> test asserts the wire bytes); `structuredClone` (cycles, Date, Map,
+> Set, typed arrays); `element.dataset`; `getComputedStyle` (a
+> computed-subset serializer published per relayout, width/height
+> answered as used px from painted geometry); and the scroll/selection/
+> focus surface — `scrollTo`/`scrollBy`/`scrollY`/`pageYOffset`/
+> `scrollIntoView`/`scrollTop`, `focus()`/`blur()` (queued through the
+> poll, applied like any engine focus), `document.activeElement`,
+> `getSelection().toString()` (engine selection text). Engine-side: the
+> publish path now carries view state (scroll/active/selection) on every
+> publish and the computed-style map on relayout; script focus reuses the
+> same body as the handle-based `focus_node`. Suite: kitae_core page-js
+> 28/28 (258 total with the feature, 224 without), workspace sweep 851/0.
+> JS-3's recorded gaps (response headers = content-type/length only,
+> fetch abort does not cancel the in-flight job, computed-subset rather
+> than full CSSStyleDeclaration, document-only scrolling) are listed in
+> `SCRIPTING_DECISION.md`.
+
+> **2026-10-15 — owner pivot: the agentic QuickJS browser is the focus**
+> (`AGENTIC_PIVOT.md`). The page-JS tier is promoted from opt-in add-on to
+> the product's core compatibility program (tiers JS-3… follow: standard
+> constructors, observers, workers, canvas, storage — each exiting on a
+> WPT subset + site-panel score), with very low RAM per tab as the
+> headline metric (CI-measured, not anecdotal) and the agent surface
+> (`kitae_mcp`, headless server, in-app agent runtime) promoted to a
+> first-class track. The engine/display-list architecture continues
+> unchanged as the renderer; the first-vision phases (reading/app suite)
+> continue but get no new feature starts while the compatibility and
+> agentic tracks run. WASM remains a full "never" pending an explicit
+> owner decision. Operative plan: `ROADMAP.md` §The current plan
+> (Tracks A–E).
+
+> **2026-10-15 — tier JS-2: the page-JS tier runs framework-era scripts**
+> (`SCRIPTING_DECISION.md` amended; all four planned fronts landed in one
+> pass, each test-guarded). Animation: `requestAnimationFrame`/
+> `cancelAnimationFrame` drain from the idle tick with `performance.now()`
+> timestamps, `queueMicrotask`, `requestIdleCallback`/`cancelIdleCallback`.
+> Messaging: `MessageChannel`/`MessagePort` (ports wired pairwise; a post
+> round-trips through the loop). Geometry: the relayout path publishes
+> node boxes + viewport into the page (`set_geometry`), so
+> `getBoundingClientRect`/`offsetWidth`/`offsetHeight`/`innerWidth`/
+> `innerHeight` answer from the rendered truth (painted boxes, sub-tree
+> union fallback; reads before first layout see zeros — documented gap).
+> History: `pushState`/`replaceState` move the address bar without a
+> reload (pending-history hand-off into the engine's nav loop),
+> `back`/`forward`/`go` route through the engine's own history,
+> `popstate` fires on the loaded document, `location.hash` get/set.
+> Events: full propagation — capture root→target, both listener lists at
+> the target, bubble target→root, into window/document-delegated
+> listeners — with `stopPropagation`/`stopImmediatePropagation`/
+> `currentTarget`. Form/key hooks: the engine now dispatches
+> `keydown`/`input`/`keyup` on typing and `input`+`change` when a
+> control's value commits (checkbox/radio toggle, range pointer or arrow
+> step, select choice via `set_input_value`); `submit` reaches page
+> listeners and `preventDefault()` keeps the engine from submitting.
+> Element `value` follows select semantics (get = selected option, set =
+> move the marker) and `checked` reads/writes checkedness. Two engine-side
+> fixes fell out: click hit-testing now scores text runs as candidates
+> (width via the engine measurer, line box from `metrics_family`), so a
+> click on an anchor's *label* targets the anchor instead of the body;
+> and the JS dispatch path converts display-list NodeIds through
+> `token_for_node` (JS element tokens and DOM NodeIds are different
+> spaces — both small colliding integers; the old cast only worked by
+> accident). Suite: kitae_core page-js 252/0, workspace sweep 851/0,
+> Kitae.app rebuilt.
+
+> **2026-10-15 — tier JS-1: the page-JS tier grows real-web joints**
+> (`SCRIPTING_DECISION.md` amended). Four upgrades, each test-guarded:
+> ES modules land (`kitae_script::ModuleFetcher` + `ScriptRuntime::run_module`;
+> quickjs-ng resolves static chains and dynamic `import()` through the
+> fetcher; `page-js` collects `type="module"` blocks — inline and external —
+> behind a per-page budget of 96 modules / 1 MiB each / 6 MiB total / 12 s
+> wall clock; bare specifiers, import maps, and `data:` URLs reject
+> cleanly); `style.prop =` writes land (Proxy-backed style object over
+> the inline style attribute, camelCase→kebab, cssText, removeProperty);
+> `preventDefault()` is honored (JS-built click events carry
+> `defaultPrevented` back to the engine, which stands its default actions
+> down — and fired listeners no longer own the click, so one delegated
+> analytics handler cannot break every link); selectors reach the common
+> grammar (combinators `>` `+` `~`, attribute operators `~=` `|= `^=`
+> `$=` `*=`, `:first-child`/`:last-child`/`:nth-child(an+b)`/`:not`,
+> comma lists, element-scoped `querySelector(All)` + `closest`). Suite:
+> kitae_core page-js 244/0, workspace sweep green.
+
+> **2026-10-14 (second revision) — page JavaScript ships: the `page-js`
+> tier.** Owner decision, amending the scope again (`SCRIPTING_DECISION.md`
+> Part 2): pages may execute their own scripts when the host enables it.
+> `kitae_core` gains the cargo feature `page-js` (off by default; a build
+> without it cannot run page scripts at all), `Browser::set_page_js`, FFI
+> command 53 `KITAE_CMD_SET_PAGE_JS`, and `Engine::builder().page_js(true)`.
+> `crates/kitae_core/src/pagejs.rs` implements the shim: page scripts run
+> in document order after parse and before styling (inline + external via
+> the engine cache/origin gate with byte caps); the DOM surface is a shim
+> over the LIVE `kitae_dom` arena (tokens bridge JS objects to NodeIds, so
+> `innerHTML`/`querySelector`/mutations are first-class tree edits that the
+> ordinary restyle/relayout/republish path renders). Event loop: timers,
+> settled `fetch()` promises (via the shared pool, origin-scoped), queued
+> location navigations, and click dispatch (rect hit-test, topmost node)
+> drain from the hosts' 2 ms idle tick. Budgets per page: 64 MiB heap,
+> 8 MiB stack, 10 s interrupt deadline; errors are values; the runtime
+> survives every script. Fallback intact: all-scripts-failed + text-thin
+> body → the honest interstitial. v0 gaps documented in the decision
+> inventory (no Proxy style props, no modules/workers/canvas, preventDefault
+> not honored on engine defaults, rect-only hit-testing). Debugging lessons
+> recorded: rquickjs evaluates STRICT by default (`EvalOptions.strict=false`
+> for web semantics), and JS callbacks must run inside the `with_dom` TLS
+> scope or their DOM ops silently no-op.
+
+> **2026-10-14 (later) — QuickJS lands, scoped: `kitae_script`.** Owner
+> decision recorded in `SCRIPTING_DECISION.md` (which also amends the
+> not-do-entry below and README): QuickJS ships as the **closed-API
+> automation runtime** for user/agent scripts and server-side `kitae_ui`
+> — it never touches the page pipeline, and no web JavaScript is fetched
+> or executed. The crate embeds QuickJS via `rquickjs` (quickjs-ng, MIT;
+> licenses audit clean under the S-9 allowlist) with the guarantees as
+> first-class tests: hard memory budget, wall-clock interrupt deadline
+> (note rquickjs 0.9 semantics — the handler returning `true` *aborts*),
+> errors-as-values (`ScriptError`: Syntax/Thrown/DeadlineExceeded/
+> MemoryExceeded), a surviving-runtime contract, and a closed surface
+> (`kitae.log` v0; no `fetch`/XHR/timers). API growth follows the
+> inventory in the decision doc, one reviewed row at a time. 7 tests.
+
+> **2026-10-14 — Phase 0 begins (roadmap `ROADMAP.md`), item 1 shipped:
+> fetch off the engine thread.** A shared background fetch pool lives in
+> `kitae_net::pool`: fixed worker threads, an unbounded job queue, and a
+> claim-by-id completion store (`submit` / `take_results`) so several
+> engines — and future non-engine consumers like feed refresh — share one
+> pool without stealing each other's work. Jobs carry the page origin
+> explicitly and run the *same* origin-scoped fetch internals as the
+> engine thread, so the S-1 gate, cookies, HSTS and the response cache
+> behave byte-identically; unclaimed completions cap out oldest-first so
+> abandoned loads self-clean. `Browser` gains `set_background_fetch`:
+> with it on, top-level **http(s)** loads push history + flag loading
+> synchronously, submit to the pool, and return; `poll_fetches()` (driven
+> from the hosts' 2 ms idle tick — FFI and the Rust facade now share the
+> same tick shape) replays the exact post-fetch sequence and republishes.
+> `about:`/`file:`/`data:` pages and POST submits stay inline; the
+> displayed page (and its origin, for mid-flight link-click gating) stays
+> live until the completion lands. Direct-API/test callers keep the
+> synchronous load contract (mode defaults off). The new tick timing
+> also exposed a latent probe/consume race in the FFI tests' shared
+> `wait_for_frame_inner` helper (the frame mailbox holds only the latest
+> frame, so a publish between the size probe and the consuming call
+> breaks a `got == len` assert; worse, retrying naively discards the
+> frame the consume just delivered and the URL-filtering loops hang) —
+> the helper now returns whatever was fully delivered and reallocs only
+> on a refused copy. Fixed.
+> kitae_core lib 219 → 224
+> tests and kitae_net 79 → 84; workspace totals settle at the sweep.
+> Subresource fetches and POST submits remain engine-thread work; that is
+> the next-layer question for the feed/mail phases, not this one.
+
 
 > **Current checkpoint (2026-09-26):** serialized and default-parallel
 > workspace sweeps pass 1149 tests (3 ignored), the app bundle is current, nine
@@ -345,9 +543,10 @@ refreshed where a stable test count was available.
 ### kitae_core — orchestrator + interaction + find + a11y (174 tests, frame wire v20)
 - The embedder's orchestrator (this is what the Swift app drives).
 - **C FFI staticlib, frame wire v20**: one engine thread per tab;
-  `commands in / frames out`. Commands 1–51 cover navigation, interaction,
+  `commands in / frames out`. Commands 1–58 cover navigation, interaction,
   find, media, password/environment/privacy, HSTS confirmation, editing,
-  selection/composition, file upload, auth, inspection, and find. Frames carry
+  selection/composition, file upload, auth, inspection, find, media type,
+  page-JS, and the agent plane (54–58, below). Frames carry
   paint items + transforms/filters/clips + focus/selection + media + find +
   sticky/scroll side-lists + the AX tree and sparse optional `AXS1` semantics
   tail.
@@ -386,6 +585,45 @@ refreshed where a stable test count was available.
   capped at `HISTORY_MAX = 500` entries, evicting the oldest from the front
   (M-4, SECURITY_AUDIT.md) — back/forward semantics are position-relative, so
   the cap is invisible; `history_caps_at_max_evicting_oldest` proves it.
+
+#### The agent plane inside the engine (B4, 2026-10-16)
+
+- `kitae_core::agent::SessionState` holds everything a session carries
+  *besides* a browser — policy, rasterizer, limits, journal, grants,
+  transition clock — and every verb is a method on it taking `&mut Browser`.
+  `AgentSession` is just those two fields bundled, which is what lets the
+  app run the verbs over the browser painting its window instead of a
+  second, invisible one. One implementation, four transports
+  (`kitae_mcp`, `kitae_server`, the app's FFI, and the Track-A script host
+  through `SharedSession`).
+- **Permissions**: the installed policy is consulted first; the session's
+  default is a read-only `AllowList`; a *grant* (what the app records when
+  the user answers a prompt) outranks the policy for that verb, and nothing
+  but a host that asked can record one. Refusals carry a fixed prefix
+  (`PERMISSION_PREFIX`) so a host tells "ask the user" from "the verb
+  failed" without parsing prose.
+- **FFI commands 54–58**: `AGENT_ACT` (verb JSON in, reply out),
+  `AGENT_JOURNAL`, `AGENT_GRANT`, `AGENT_REVOKE_GRANTS`, `AGENT_DECLARE`.
+  Answers arrive on the notifications queue as `agent-result` /
+  `agent-journal` / `agent-policy` / `agent-raster`; the reply JSON is
+  `{ok, verb, result, journal}` or `{ok:false, verb, kind, message,
+  pending}`. `kitae_engine_notification_available` exists because
+  `take_notification` cannot put an oversized message back and a
+  screenshot's base64 is large.
+- **Rasterizers are injected, not compiled in.** The pure-Rust rasterizer
+  paints with `kitae_render_gpu::cpu`, which depends on `kitae_core` — so
+  the engine cannot call it without a cycle. `PageRasterVtable` +
+  `HostRaster` are the seam: a host hands over a context and three C
+  function pointers (`kitae_engine_set_raster`), and `kitae_headless`
+  exposes one call — `kitae_headless_install_raster(engine, scale)` — that
+  the app makes at startup. The same shape the app already uses for Core
+  Text measurement.
+- Behaviour is pinned by tests at three levels: `kitae_core`'s agent tests
+  (verbs over a real page), two FFI tests driving a live engine thread
+  (permission flow end to end; a host rasterizer reading the engine's own
+  browser), and `make -C app ffi-smoke`, which does the app's exact C calls
+  (install raster → `read` → `navigate` prompts → `screenshot` returns a
+  real PNG).
 
 ### kitae_layout — the heart (232 tests)
 `layout(dom, styles, width, tm) -> DisplayList`.
@@ -784,7 +1022,7 @@ cases remain documented limitations.
 ---
 
 ## 4. Non-negotiable design rules
-1. **No JavaScript, no JS engines — ever.** The engine's endpoint is the display list.
+1. **No JavaScript in the page pipeline — ever.** The engine's endpoint is the display list. (Amended 2026-10-14, `SCRIPTING_DECISION.md`: QuickJS ships **only** as `kitae_script`, the closed-API automation runtime for user/agent scripts and server-side `kitae_ui` — it never touches fetched pages, and no web script executes in the render path.)
 2. **No WASM — ever**, out by design.
 3. Pure Rust engine first; vendored C/C++ stays behind the existing policy
    (currently the QTSQ decoder), while shaping uses `rustybuzz`.

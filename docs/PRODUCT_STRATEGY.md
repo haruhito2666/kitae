@@ -4,6 +4,45 @@ _What Kitae is for, which markets it can win, which it cannot, and how it gets
 distributed. Written 2026-10-11 against the 2026-09-26 engine checkpoint
 (`ENGINE_CORE_STATUS.md`). Companion document: [`ROADMAP.md`](ROADMAP.md)._
 
+> **Amended 2026-10-15 by owner decision (see
+> [`AGENTIC_PIVOT.md`](AGENTIC_PIVOT.md)):** the market verdicts below are
+> revised in place meaning — the "general daily-driver browser" and
+> "WPT-conformance race" verdicts change from *abandon* to *bounded core
+> program*, re-entered through a different door: a standard-JS browser on
+> QuickJS, differentiated on very low RAM, speed, and complete agentic
+> capability, aimed first at the agent audience. The document-browser and
+> reading-beachhead theses become the secondary "first vision" track. The
+> headline product claim becomes: the pages agents need, at a fraction of
+> Chrome's footprint, driven end-to-end by agents.
+
+## 0. The current strategy (2026-10-15 — supersedes §2 where they differ)
+
+**Build the complete agentic browser: a standard-JS browser running its
+pages on QuickJS — the smallest RAM footprint in its class, very fast,
+and driveable end-to-end by agents.**
+
+- The differentiation is not "we render it too": it is resource honesty
+  (per-page RAM is CI-measured against Chrome/Safari and published — the
+  scoreboard is the claim) plus agency (a closed, permissioned action
+  surface the browser itself exposes, `docs/ROADMAP.md` Tracks B).
+- The entry market is agents, not consumers: agent fleets pay for RAM
+  economics directly (pages-per-dollar), and agents accept a bounded,
+  scored compatibility panel. The consumer agentic app (B4) is the habit
+  that grows behind the headless surface (B2/B3) — this ordering is the
+  recorded recommendation, not yet a shipped reality.
+- The agent audience reframes the old impossibility verdicts: the
+  compatibility race is bounded by the panel + WPT-subset discipline
+  (`docs/ROADMAP.md`, Track A), not by the spec-maximalist human web.
+- The engine's security posture becomes a product feature for agents:
+  every page's JS runs under hard memory/time budgets with an
+  origin-gated network — a materially smaller blast radius for
+  prompt-injection-by-webpage than a hosts-V8-in-process architecture
+  can honestly claim.
+- Sections 1–8 below now read as the first-vision analysis that remains
+  true wherever the pivot does not amend them (the diagnosis of the
+  document-shaped web, the reader/a11y/print strengths, the distribution
+  calculus); §3's board rows flip exactly as the amendment above states.
+
 ---
 
 ## 1. The honest diagnosis
@@ -51,9 +90,9 @@ The one bet underneath the whole strategy:
 | kitae_ui / kitae_live as a "no-JS web framework" | Very hard — defer | Devs must learn a framework *and* abandon React. Dogfood via the first-party suite first |
 | QTSQ as a flagship feature | Deprioritize | Own format, no ecosystem. Keep as an engineering showcase; zero marketing spend |
 | Kitae Bridge (server-side JS execution proxy) | Nearly impossible — abandon | Operating a headless-Chrome fleet: cost, legal grayness, ops — and it destroys the zero-attack-surface purity that differentiates |
-| Daily-driver general browser (industry definition) | Nearly impossible — abandon | No-JS ceiling + Chromium/WebKit monopoly |
+| Daily-driver general browser (industry definition) | **The destination (2026-10-15, §0)** | The ceiling argument died with the page-JS tier; the path is agents first, consumers behind them, on one bounded panel at a time |
 | iOS / Android browser | Very hard — later | iOS mandates WKWebView for browsers; Android is Chromium in practice. macOS-only is honest, not sad |
-| WPT conformance race vs Chromium | Nearly impossible — abandon | Hundreds of engineers on the other side; the tail is unbounded. Compete on the pages people actually read, not on the spec |
+| WPT conformance race vs Chromium | **Bounded core program (2026-10-15, §0)** | Or: it was. The race is re-entered bounded — agent-relevant panel + WPT subsets, scored; the unbounded human tail still stays out of scope |
 
 ### Nearly impossible (do not spend a year here)
 

@@ -1,0 +1,57 @@
+[package]
+name = "kitae_headless"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lib]
+name = "kitae_headless"
+# staticlib: the app links it (`kitae_headless_install_raster`) — the raster
+# code has to be in the app's link line for the engine's vtable to resolve.
+# rlib: the servers depend on the crate as a Rust library.
+crate-type = ["staticlib", "rlib"]
+
+# The pure-Rust page rasterizer: pixels and print for the agent plane, with
+# no window server, no Core Text and no SDL. It is what the MCP server and
+# the HTTP server install as their `PageRaster`, and what a Linux container
+# uses — the app keeps its own Core Text path.
+#
+# It also exports the C ABI (`src/abi.rs`) the app links to install the very
+# same rasterizer on its own browser: a `PageRaster` needs `&Browser`, which
+# only the engine owns, so the app reaches it through a vtable of C function
+# pointers rather than by the rasterizer living inside kitae_core — the CPU
+# compositor it paints with lives *above* kitae_core in the crate graph
+# (kitae_render_gpu depends on the engine), so the engine cannot call it
+# directly.
+#
+# Dependencies, each justified:
+# - kitae_core/_layout/_media/_render_gpu: the engine's display list, CPU
+#   compositor and PNG encoder (all workspace-internal).
+# - fontdb: already in the tree through resvg's `system-fonts` feature; it
+#   enumerates the system's fonts (no font files are committed to this repo,
+#   and a browser that renders text must find the user's fonts).
+# - ttf-parser: already in the tree through rustybuzz/fontdb; glyph indices,
+#   advances and — the reason it is here at all — glyph **outlines**.
+# - tiny-skia: already in the tree through resvg; antialiased path filling
+#   turns those outlines into coverage masks.
+# - flate2: already in the tree through png/kitae_media; PDF image streams
+#   are zlib-compressed.
+#
+# No C, no Core Text, no new code downloaded: every crate above is already
+# compiled into this workspace's binaries.
+[dependencies]
+kitae_core = { path = "../kitae_core" }
+kitae_json = { path = "../kitae_json" }
+kitae_layout = { path = "../kitae_layout" }
+kitae_media = { path = "../kitae_media" }
+kitae_render_gpu = { path = "../kitae_render_gpu" }
+fontdb = "0.23"
+ttf-parser = "0.25"
+tiny-skia = "0.11"
+flate2 = "1"
+
+[dev-dependencies]
+# The tests decode the PNG the rasterizer produced.
+png = "0.18"
+# …and drive the verbs through the session, which is what the transports do.
+kitae_agent = { path = "../kitae_agent" }

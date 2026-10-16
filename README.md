@@ -1,12 +1,30 @@
 # Kitae
 
+> **2026-10-15 — owner pivot: Kitae's focus is now the complete agentic
+> browser.** A standard-JS browser running pages through QuickJS (no V8,
+> ever), differentiated by the smallest RAM footprint in its class
+> (CI-measured against Chrome and Safari, published) and by a complete
+> agent plane (`kitae_mcp`, headless server, in-app agent runtime). The
+> positioning below — "the web, without the noise" — remains true, and
+> the pure-Rust engine keeps building; it is now the foundation the
+> agentic browser stands on rather than the headline. Decision record:
+> [`docs/AGENTIC_PIVOT.md`](docs/AGENTIC_PIVOT.md); operative plan:
+> [`docs/ROADMAP.md`](docs/ROADMAP.md), Tracks A–E.
+
 **The web, without the noise.**
 
-Kitae is a typography-first browser *engine* for the static web, written in
-pure Rust, with a native macOS frontend written in Swift (AppKit + Core Text).
-There is **no JavaScript engine** — no V8, no QuickJS, no scripting of any
-kind. Kitae reads the web the way a reader app does: text, structure, links.
-That's it.
+Kitae is a typography-first browser, written in pure Rust, with a native
+macOS frontend written in Swift (AppKit + Core Text). The display list is
+the engine's endpoint and the Swift app only decodes frames and draws.
+Page JavaScript is **QuickJS, never V8, no JIT** — run through the
+`page-js` tier, a budgeted shim over the real DOM (hard memory/time
+budgets per page, origin-gated network), shipped in two parts
+(`docs/SCRIPTING_DECISION.md`): `kitae_script`, the closed-API runtime
+for user/agent automation scripts against Kitae's document API, and the
+page-JS tier that carries the sites' own scripts — the shipped app runs
+it on every tab, and making it a standard-JS browser is the current
+compatibility program (`docs/ROADMAP.md`, Track A: tiers JS-3…JS-6 with
+a scored conformance panel).
 
 The name is intentional and stays: **Kitae**.
 
@@ -129,8 +147,12 @@ cd app && make ffi-smoke        # one-shot C consumer: frame bytes + version 20
 
 ## Known limits (current scope)
 
-- Fetch is synchronous on the engine thread (per-tab; the UI never blocks),
-  and an oversized stylesheet is rejected *after* the body is fetched.
+- Subresource fetches (stylesheets, images, fonts) still run on the engine
+  thread, as do POST form submits. Top-level http(s) document loads ride a
+  shared background fetch pool (`kitae_net::pool`) in the hosts that opt in —
+  the tab's engine thread stays free between submit and completion, and the
+  host applies the response from its idle tick. An oversized stylesheet is
+  still rejected *after* the body is fetched.
 - CSS covers a broad practical subset (selectors, cascade/layers/scope,
   flex/grid, multi-column, tables, backgrounds incl. multi-layer, transforms,
   filters, transitions/animations, `@media`/`@container`, `@font-face`), not

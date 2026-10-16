@@ -6692,7 +6692,10 @@ impl<'a> Layout<'a> {
                     .or_else(|| forced.and_then(|f| f.link_href.clone()));
                 match self.dom.tag(node) {
                     "br" => self.flush_line(frame),
-                    "img" => {
+                    "img" | "canvas" => {
+                        // A canvas is a replaced element with a natural size
+                        // (`width`/`height` attributes, 300x150 default) whose
+                        // raster arrives from page JS.
                         self.layout_image(node, &style, link, frame);
                     }
                     "svg" => {
@@ -7124,6 +7127,13 @@ impl<'a> Layout<'a> {
     /// assumed 1, `sizes` deferred). Falls back to the img's own `src`. An
     /// `<img media>` that does not match selects nothing at all.
     fn resolved_img_src(&self, node: NodeId) -> String {
+        // A `<canvas>` paints its own backing store: page JavaScript draws
+        // into a JS-side buffer and the engine registers the pixels under
+        // this sentinel (the same contract `\0media:` uses for `<video>`
+        // frames). There is nothing to fetch and no `src` to resolve.
+        if self.dom.tag(node) == "canvas" {
+            return format!("\u{0}canvas:{}", node.0);
+        }
         let el = self.dom.element(node);
         // A3: the `<img>`'s own `media` attribute gates the element as a
         // whole — no `src`, no `<picture>` source, nothing to fetch — exactly

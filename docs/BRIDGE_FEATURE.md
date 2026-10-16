@@ -1,5 +1,15 @@
 # Future Feature: The Kitae Bridge
 
+> **Amended 2026-10-15:** the owner pivot (`AGENTIC_PIVOT.md`) overturned
+> the premise below — Kitae now runs page JavaScript itself (QuickJS,
+> `SCRIPTING_DECISION.md` Part 3), so the Bridge's "the engine never
+> executes script" promise no longer holds and its role as the scripted-
+> web answer is retired. What survives as relevant: the *budgeted*
+> QuickJS sandbox + origin gates give the agent audience the small blast
+> radius the Bridge argued for, and the escalation-service idea returns
+> only as Track-E-style graceful delegation to the system browser. This
+> doc stays as a design record.
+>
 > Status: **future, browser-layer feature — not scheduled.** This doc
 > records the design so the engine never accidentally closes the door on
 > it. It belongs to the *browser* (Kitae.app and any embedder's product

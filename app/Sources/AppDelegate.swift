@@ -28,6 +28,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate,
     private var settingsController: SettingsWindowController?
     /// H5: the read-only inspector panel (created on first use).
     private var inspectorPanel: InspectorPanel?
+    /// B4: the agent panel — activity, prompt and triggers for the verbs
+    /// running on the active tab (created on first use).
+    private var agentPanel: AgentPanel?
     /// QTSQ audio transport, docked below the card when the active page
     /// publishes an audio MediaInfo (the engine decodes to a temp CAF; this
     /// view plays it and mirrors transport back through command 16).
@@ -411,6 +414,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate,
                                                action: #selector(toggleInspector(_:)),
                                                keyEquivalent: "i")
         inspectMenuItem.keyEquivalentModifierMask = [.command, .option]
+        let agentMenuItem = viewMenu.addItem(withTitle: "Agent Panel",
+                                             action: #selector(toggleAgentPanel(_:)),
+                                             keyEquivalent: "a")
+        agentMenuItem.keyEquivalentModifierMask = [.command, .option]
 
         // History
         let historyItem = NSMenuItem()
@@ -487,6 +494,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate,
             ("Sidebar Layout", { [weak self] in self?.setLayoutMode(.sidebar) }),
             ("Settings…", { [weak self] in self?.showSettings(nil) }),
             ("Inspect Element", { [weak self] in self?.toggleInspector(nil) }),
+            ("Agent Panel", { [weak self] in self?.toggleAgentPanel(nil) }),
             ("Reopen Closed Tab", { [weak self] in self?.reopenClosedTab(nil) }),
         ]
         palette.setSources(tabs: tabItems, actions: actions)
@@ -851,6 +859,42 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate,
         if let panel = inspectorPanel, panel.isVisible { panel.hide(); return }
         activeTabInspectInfoDidArrive(
             info: "⌘-click an element on the page to inspect it.")
+    }
+
+    // MARK: Agent panel (B4)
+
+    /// The panel drives the *active tab's* engine: ask, grant, revoke and
+    /// read the journal all go through the same verbs kitae_mcp exposes, on
+    /// the browser the user is looking at.
+    @objc func toggleAgentPanel(_ sender: Any?) {
+        if let panel = agentPanel, panel.isVisible { panel.hide(); return }
+        let panel = agentPanel ?? AgentPanel()
+        agentPanel = panel
+        panel.onRequest = { [weak self] request in
+            self?.tabManager.activeTab?.engine.agentAct(request)
+        }
+        panel.onGrant = { [weak self] verb in
+            self?.tabManager.activeTab?.engine.agentGrant(verb)
+        }
+        panel.onRevoke = { [weak self] in
+            self?.tabManager.activeTab?.engine.agentRevokeGrants()
+        }
+        panel.onJournal = { [weak self] in
+            self?.tabManager.activeTab?.engine.agentJournal()
+        }
+        panel.show(in: window)
+    }
+
+    func activeTabAgentDidAnswer(reply: String) {
+        agentPanel?.apply(reply: reply)
+    }
+
+    func activeTabAgentJournalDidArrive(journal: String) {
+        agentPanel?.apply(journal: journal)
+    }
+
+    func activeTabAgentPolicyDidChange(policy: String) {
+        agentPanel?.apply(policy: policy)
     }
 
     // MARK: Canvas plumbing

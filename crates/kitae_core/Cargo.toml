@@ -14,16 +14,33 @@ crate-type = ["staticlib", "rlib"]
 kitae_css = { path = "../kitae_css" }
 kitae_dom = { path = "../kitae_dom" }
 kitae_html = { path = "../kitae_html" }
+# B5: the agent plane's wire codec (hand-rolled, zero-dependency).
+# `kitae_core::extract` shapes agent-facing JSON, and must do so with
+# `page-js` off — a headless server that never runs page scripts still
+# answers `extract`.
+kitae_json = { path = "../kitae_json" }
+# B1/B2/B3/B4: the verb vocabulary the agent plane is driven by — shape and
+# permission hook, no QuickJS.
+kitae_agent = { path = "../kitae_agent" }
 kitae_layout = { path = "../kitae_layout" }
 kitae_media = { path = "../kitae_media" }
 kitae_net = { path = "../kitae_net" }
 kitae_qtsq = { path = "../kitae_qtsq" }
+# SCRIPTING_DECISION.md: page JavaScript runs on kitae_script's budgeted
+# QuickJS — feature-gated, off by default, never linked without the host
+# opting in.
+kitae_script = { path = "../kitae_script", optional = true }
 kitae_shape = { path = "../kitae_shape" }
 kitae_style = { path = "../kitae_style" }
 kitae_ui = { path = "../kitae_ui" }
 # S-7 (SECURITY_AUDIT.md): the QTSQ unlock password is zeroized on drop —
 # the one credential the engine holds should not idle in freed heap.
 zeroize = "1"
+# B6: SHA-256 for evidence manifests. `ring` is already in the app's link
+# line (kitae_net's rustls uses the ring provider by design, CPP_ROLE.md),
+# so this adds no new compiled code — and hand-rolling SHA-256 to avoid a
+# dependency we ship anyway would be the worse trade.
+ring = "0.17"
 # Phase 2 (UI_LIBRARY_PLAN.md): the Live client — patch applier + event
 # sender against a kitae_live server. Feature-gated so embedders that
 # never speak KTLV link none of it.
@@ -33,6 +50,21 @@ percent-encoding = { workspace = true }
 [features]
 default = []
 live = ["dep:kitae_live"]
+# SCRIPTING_DECISION.md: opt-in page JavaScript (QuickJS through the DOM
+# shim in pagejs). Without this feature the binary cannot execute page
+# scripts at all — the render path is untouched.
+#
+# LADDER EXIT (owner gate, 2026-10-16): the Track-A tiers JS-3…JS-6 are
+# feature-complete and measured (WPT page-JS subset in
+# tests/wpt_page_js.rs, tier library tests with this feature on), and the
+# shipped app runs the tier on every tab. The last exit item is making
+# this feature DEFAULT-ON for library builds: `default = ["page-js"]` in
+# the line above, which pulls `kitae_script`/QuickJS into every embedder's build
+# (binary size, RAM floor, and the security surface of executing page
+# scripts) and changes the no-feature fallbacks in lib.rs into dead code.
+# That flip is the owner's call — recorded here so it is a one-line
+# change, not a rediscovery.
+page-js = ["dep:kitae_script"]
 
 [dev-dependencies]
 # Q8: the engine-level animation test builds its GIF fixture with the same

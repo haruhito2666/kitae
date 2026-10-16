@@ -391,4 +391,50 @@ extension NativeContractTests {
         ("testInfoPlistRegistersTheDeepLinkScheme", testInfoPlistRegistersTheDeepLinkScheme),
         ("testGpuHandleCanBeInitializedAndReleased", testGpuHandleCanBeInitializedAndReleased),
     ]
+
+    // MARK: B4 — the agent panel's wire handling
+
+    /// The panel interpolates the user's own text (selectors, paths) into the
+    /// verb JSON it sends, so escaping is a correctness *and* an injection
+    /// concern: a quote in a selector must not be able to end the string.
+    func testAgentPanelEscapesUserTextIntoValidJSON() {
+        let nasty = "a\"b\\c\nd\te\u{01}"
+        let request = "{\"verb\":\"find\",\"query\":\"\(AgentPanel.escape(nasty))\"}"
+        let data = Data(request.utf8)
+        let parsed = try? JSONSerialization.jsonObject(with: data) as? [String: Any]
+        XCTAssertEqual(parsed?["query"] as? String, nasty,
+                       "the escaped text round-trips through a JSON parser")
+    }
+
+    /// A read verb's reply parses; so does a permission refusal. The panel
+    /// keys its prompt off `kind` + `pending`, so those two fields are the
+    /// contract worth pinning.
+    func testAgentPanelReadsRepliesAndRefusals() {
+        let ok = #"{"ok":true,"verb":"read","result":{"url":"https://x/","text":"hi"},"journal":[{"seq":1,"verb":"read","outcome":"ok — x","elapsedMs":3}]}"#
+        let parsed = AgentPanel.parse(ok)
+        XCTAssertEqual(parsed?["ok"] as? Bool, true)
+        XCTAssertEqual(parsed?["verb"] as? String, "read")
+        XCTAssertEqual((parsed?["journal"] as? [[String: Any]])?.count, 1)
+
+        let refused = #"{"ok":false,"verb":"click","kind":"permission","message":"click needs the user's OK","pending":true}"#
+        let refusal = AgentPanel.parse(refused)
+        XCTAssertEqual(refusal?["kind"] as? String, "permission")
+        XCTAssertEqual(refusal?["pending"] as? Bool, true)
+
+        XCTAssertNil(AgentPanel.parse("not json at all"))
+    }
+
+    /// The activity list is the audit: a refused row must read as refused,
+    /// and the journal arrives as a JSON array.
+    func testAgentPanelRendersRefusalsAndJournals() {
+        let journal = #"[{"seq":1,"verb":"click","denied":"click is not allowed","outcome":"denied","elapsedMs":1},{"seq":2,"verb":"read","outcome":"ok — Example","elapsedMs":4}]"#
+        let rows = AgentPanel.parseArray(journal)
+        XCTAssertEqual(rows?.count, 2)
+        let refused = AgentPanel.row(from: rows![0]).line
+        XCTAssertTrue(refused.contains("refused: click is not allowed"), refused)
+        let allowed = AgentPanel.row(from: rows![1]).line
+        XCTAssertTrue(allowed.contains("#2 read — ok — Example  (4 ms)"), allowed)
+        XCTAssertNil(AgentPanel.parseArray(#"{"grants":[]}"#),
+                     "an object is not a journal")
+    }
 }

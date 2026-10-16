@@ -5,17 +5,29 @@
 //! A host provides text measurement (real fonts on macOS via Core Text, an
 //! approximation in tests) and receives finished frames through [`Host`].
 //!
-//! No JavaScript is ever fetched, stored, or executed — script-only pages get
-//! a noscript fallback or an interstitial with an escape hatch to the system
-//! browser. There is no window, no event loop, no I/O threading in this
-//! crate: hosts own those.
+//! The closed-API script runtime ([`kitae_script`]) drives only Kitae's own
+//! automation surfaces. Page JavaScript is a separate, opt-in tier (the
+//! `page-js` feature plus a per-engine enable): when on, a site's content
+//! scripts run under fixed time/memory budgets; when a scripted page cannot
+//! be rendered that way it still gets the noscript fallback or an
+//! interstitial with an escape hatch to the system browser. The page's
+//! window and its event loop live in that tier ([`pagejs`]) and are drained
+//! by the host's idle tick; hosts own threading and I/O.
 
+// B1-B4: the agent plane's host — a real `Browser` behind the verbs.
+pub mod agent;
 mod embedder;
+// B6: signed QTSQ archives as evidence.
+pub mod evidence;
+// B5: page-as-data extraction — the agent's input layer.
+pub mod extract;
 mod ffi;
 #[cfg(feature = "live")]
 pub mod live;
 pub mod markdown;
 mod media_attrs;
+#[cfg(feature = "page-js")]
+pub mod pagejs;
 pub mod start_page;
 pub mod ui;
 
@@ -571,6 +583,22 @@ enum PendingNavigation {
     },
 }
 
+/// Phase 0: a top-level network navigation currently fetching on the
+/// shared kitae_net pool. Exists between `begin_background_load` and the
+/// matching `poll_fetches` completion. Superseded loads leave their
+/// response unclaimed: the pool claims only the current job's id, and an
+/// orphaned answer ages out through the pool's own cap (its data still
+/// warms the response cache for back/forward).
+struct PendingLoad {
+    id: u64,
+    /// The submitted (post-normalization) URL. Render runs against it
+    /// exactly as the synchronous path would.
+    url: String,
+    /// QTSQ unlock password threaded to the render stage; Zeroized with
+    /// the same discipline as `qtsq_password` (S-7).
+    password: Option<zeroize::Zeroizing<String>>,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct TextSelection {
     anchor: usize,
@@ -615,6 +643,11 @@ fn splice_chars(value: &str, start: usize, end: usize, replacement: &str) -> Str
 /// The host owns presentation (window, chrome, scrolling, painting) and
 /// drives this with commands: [`Browser::navigate`], [`Browser::go`],
 /// [`Browser::reload`], [`Browser::resize`], [`Browser::click`].
+/// One token per `Browser`: the scope of its `sessionStorage` (the area is
+/// private to the browser and survives navigation inside it).
+#[cfg(feature = "page-js")]
+static NEXT_STORAGE_SESSION: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+
 pub struct Browser {
     host: Box<dyn Host>,
     /// Shared with the style engine (B9): `Arc` so `MeasurerMetrics` can
@@ -711,6 +744,31 @@ pub struct Browser {
     /// prompt can never answer for a different page.
     pending_auth: Option<AuthPrompt>,
     pending_navigation: Option<PendingNavigation>,
+    /// Phase 0: when on, top-level http(s) navigations submit their fetch
+    /// to the shared kitae_net pool instead of blocking this thread — the
+    /// displayed page (its clicks included, gated against its own origin)
+    /// stays live until `poll_fetches` applies the completion. `about:`,
+    /// `file:` and every other non-network scheme loads inline exactly as
+    /// before; POST form submits stay synchronous. Hosts opt in at
+    /// construction; the default off keeps direct-API, test and CLI
+    /// callers on the fully synchronous contract.
+    background_fetch: bool,
+    /// Phase 0: the in-flight pooled navigation, if any (one per tab).
+    pending_load: Option<PendingLoad>,
+    /// SCRIPTING_DECISION.md: page JavaScript opt-in (feature `page-js`).
+    /// Off by default; hosts set it before the first navigation.
+    page_js_enabled: bool,
+    /// The page's live script runtime, built at the load's script phase
+    /// and dropped at the next navigation.
+    #[cfg(feature = "page-js")]
+    page_js: Option<pagejs::JsPage>,
+    /// Web-storage session token, fixed for this browser's lifetime so
+    /// `sessionStorage` survives same-tab navigation.
+    #[cfg(feature = "page-js")]
+    storage_session: u64,
+    /// A back/forward move is in flight: when the loaded document's URL
+    /// matches this target, `popstate` fires on it (page-js only).
+    pending_popstate: Option<String>,
     /// kitae_ui application mounted on the current page (Phase 1): `Some`
     /// exactly when the page came from a component tree (`about:start` for
     /// now) instead of fetched HTML. Its patch ops drive incremental
@@ -795,6 +853,14 @@ impl Browser {
             file_picks: HashMap::new(),
             pending_auth: None,
             pending_navigation: None,
+            background_fetch: false,
+            pending_load: None,
+            page_js_enabled: false,
+            pending_popstate: None,
+            #[cfg(feature = "page-js")]
+            page_js: None,
+            #[cfg(feature = "page-js")]
+            storage_session: NEXT_STORAGE_SESSION.fetch_add(1, Ordering::Relaxed),
             app: None,
             #[cfg(feature = "live")]
             live: None,
@@ -804,6 +870,40 @@ impl Browser {
     }
 
     /// Current public state (for hosts that poll instead of caching publish).
+    /// Whether a top-level load is still in flight (the pooled/background
+    /// path). The agent plane's settle loop polls this; a host's frame loop
+    /// reads it through the published frame instead.
+    pub fn load_in_flight(&self) -> bool {
+        self.pending_load.is_some()
+    }
+
+    /// The current document's tree. `None` before the first load. Read-only:
+    /// mutations go through the engine's own APIs so layout and scripts stay
+    /// in step.
+    pub fn page_dom(&self) -> Option<&Dom> {
+        self.page.as_ref().map(|p| &p.dom)
+    }
+
+    /// Whether a page-script session is live: the `page-js` feature is on,
+    /// scripting is enabled for this browser, and the current page actually
+    /// produced a session. Always `false` without the feature.
+    pub fn page_js_running(&self) -> bool {
+        #[cfg(feature = "page-js")]
+        {
+            self.page_js_enabled && self.page_js.is_some()
+        }
+        #[cfg(not(feature = "page-js"))]
+        {
+            false
+        }
+    }
+
+    /// The viewport this browser lays out at, in CSS pixels — what an
+    /// evidence manifest must record for a replay to be meaningful.
+    pub fn viewport_size(&self) -> (f32, f32) {
+        (self.viewport_w, self.viewport_h)
+    }
+
     pub fn state(&self) -> PublicState {
         PublicState {
             url: self.page_url.clone(),
@@ -1018,8 +1118,21 @@ impl Browser {
         let old_page_for_media = self.page_url.clone();
         self.find_active = None;
         self.find_matches.clear();
-        let (dom, root, styles) =
-            prepare_in_env(html, base_url, self.viewport_w, &self.environment);
+        // SCRIPTING_DECISION.md: embedder-supplied pages script only when
+        // the host opted in; the mutated tree styles + lays out below.
+        let (dom, root, styles, js_title) = match self.try_render_with_page_js(html, base_url) {
+            Some((d, r, s, t)) => (d, r, s, Some(t)),
+            #[cfg(not(feature = "page-js"))]
+            None => {
+                let (d, r, s) = prepare_in_env(html, base_url, self.viewport_w, &self.environment);
+                (d, r, s, None)
+            }
+            #[cfg(feature = "page-js")]
+            None => {
+                let (d, r, s) = prepare_in_env(html, base_url, self.viewport_w, &self.environment);
+                (d, r, s, None)
+            }
+        };
         let resource_base_url = resource_base_url(&dom, root, base_url);
         self.page_url = base_url.to_string();
         // Embedder-supplied HTML has no network context: its (local)
@@ -1028,7 +1141,9 @@ impl Browser {
         release_qtsq_page_state(&old_page_for_media);
         clear_web_media_for(&old_page_for_media);
         self.host.location_changed(&self.page_url);
-        self.page_title = root.and_then(|r| page_title(&dom, r)).unwrap_or_default();
+        self.page_title = js_title
+            .or_else(|| root.and_then(|r| page_title(&dom, r)))
+            .unwrap_or_default();
         self.page = Some(Page {
             html: html.to_string(),
             base_url: base_url.to_string(),
@@ -1053,6 +1168,7 @@ impl Browser {
         }
         let index = target as usize;
         let url = self.history[index].clone();
+        self.pending_popstate = Some(url.clone());
         self.request_navigation(url, PendingHistory::Position(index));
     }
 
@@ -1184,6 +1300,16 @@ impl Browser {
         if self.app.is_some() && self.app_click(x, y) {
             return;
         }
+        // SCRIPTING_DECISION.md (amended): with page JS on, the page's own
+        // listeners get the click before the engine's hit paths. Browser
+        // semantics: default actions proceed unless a listener called
+        // preventDefault() — so listeners no longer *own* the click (one
+        // delegated analytics handler must not break every link). A
+        // prevented click stands the engine's paths down entirely.
+        #[cfg(feature = "page-js")]
+        if self.page_js_enabled && self.page_js.is_some() && self.dispatch_page_js_click(x, y) {
+            return;
+        }
         // A6: an open modal dialog gates the click. Outside the card, the
         // click is swallowed (spec default: the backdrop does not close the
         // dialog); inside, falls through to toggles/links as usual. Card
@@ -1269,26 +1395,29 @@ impl Browser {
         }
         // Q5: sticky boxes shift at paint time; hit-test their links at the
         // shifted position so the engine agrees with what the host shows.
-        let shifted = |i: usize, ly: f32| -> f32 {
+        //
+        // The shift moves the *rect*, so it must move the click point the
+        // other way: `LinkArea::contains` knows the unshifted geometry, and
+        // feeding it the link's own y (rather than the click's) would make
+        // the vertical test vacuous — every click in the link's x-span
+        // would activate it, however far above or below the link it landed.
+        let sticky_shift = |i: usize| -> f32 {
             let Some(dl) = self.last_dl.as_ref() else {
-                return ly;
+                return 0.0;
             };
             for s in &dl.stickies {
                 let (start, count) = (s.link.0 as usize, s.link.1 as usize);
                 if i >= start && i < start + count {
-                    return ly + s.shift(self.scroll_y, self.viewport_h);
+                    return s.shift(self.scroll_y, self.viewport_h);
                 }
             }
-            ly
+            0.0
         };
         let Some(link) = self
             .links
             .iter()
             .enumerate()
-            .find(|(i, l)| {
-                let ly = shifted(*i, l.y);
-                l.contains(x, ly)
-            })
+            .find(|(i, l)| l.contains(x, y - sticky_shift(*i)))
             .map(|(_, l)| l)
         else {
             return;
@@ -1356,55 +1485,25 @@ impl Browser {
     /// are first because their inline geometry is exact (and an image inside
     /// a link reasonably reports the link). Nothing hit → silent.
     pub fn pick_inspect(&mut self, x: f32, y: f32) {
-        let Some(dl) = self.last_dl.as_ref() else {
-            return;
-        };
+        if let Some(node) = self.node_at_point(x, y) {
+            self.host.notify(&format!("inspect\t{}", node.0));
+        }
+    }
+
+    /// The DOM node under a page point, in the inspector's priority order:
+    /// links, then text runs, then images, then painted boxes. `None` when
+    /// the point lands on nothing the last frame drew.
+    ///
+    /// The agent plane uses this to say *which* node a click acted on — the
+    /// same resolution its own hit-testing performs, asked as a query.
+    pub fn node_at_point(&self, x: f32, y: f32) -> Option<NodeId> {
+        let dl = self.last_dl.as_ref()?;
         for link in dl.links.iter().rev() {
             if link.contains(x, y) {
-                self.host.notify(&format!("inspect\t{}", link.node));
-                return;
+                return Some(NodeId(link.node));
             }
         }
-        // Runs carry no width, so a text hit is: the baseline band around the
-        // point, then the run whose start is at or left of it — the rightmost
-        // such run on the line contains the point. A justified gap can hand
-        // the point to the previous run, but word runs share their block's
-        // node, so the report stays the element the user aimed at.
-        let mut text_hit: Option<(f32, u32)> = None;
-        for t in &dl.texts {
-            if t.size <= 0.0 {
-                continue;
-            }
-            let top = t.y - t.size * 0.9;
-            let bottom = t.y + t.size * 0.35;
-            if y >= top && y <= bottom && x >= t.x - 2.0 {
-                if text_hit.map_or(true, |(bx, _)| t.x > bx) {
-                    text_hit = Some((t.x, t.node));
-                }
-            }
-        }
-        if let Some((_, node)) = text_hit {
-            self.host.notify(&format!("inspect\t{node}"));
-            return;
-        }
-        for img in dl.images.iter().rev() {
-            if x >= img.x && x <= img.x + img.w && y >= img.y && y <= img.y + img.h {
-                self.host.notify(&format!("inspect\t{}", img.node));
-                return;
-            }
-        }
-        // Painted boxes. Matrix-transformed rects store pre-transform
-        // geometry (the dialog hit-test maps corners through the matrix);
-        // the inspector tolerates the gap for those rare items.
-        for r in dl.rects.iter().rev() {
-            if r.transform.is_some() {
-                continue;
-            }
-            if x >= r.x && x <= r.x + r.w && y >= r.y && y <= r.y + r.h {
-                self.host.notify(&format!("inspect\t{}", r.node));
-                return;
-            }
-        }
+        node_at_point_in(dl, x, y)
     }
 
     /// H5: the inspector report for `node` — a `tag#id.classes` header, the
@@ -1679,6 +1778,13 @@ impl Browser {
                 if let Some(page) = self.page.as_mut() {
                     page.dom.set_attr(node, "value", &s);
                 }
+                #[cfg(feature = "page-js")]
+                {
+                    // A pointer on a range commits a value: input + change,
+                    // like every discrete control.
+                    let _ = self.dispatch_js_event_at("input", node, None);
+                    let _ = self.dispatch_js_event_at("change", node, None);
+                }
                 self.relayout();
             }
             ("input", "checkbox" | "radio" | "submit" | "image" | "button") => {
@@ -1797,6 +1903,12 @@ impl Browser {
                 if let Some(page) = self.page.as_mut() {
                     page.dom.set_attr(f, "value", &s);
                 }
+                #[cfg(feature = "page-js")]
+                {
+                    // Stepping commits a value: input + change.
+                    let _ = self.dispatch_js_event_at("input", f, None);
+                    let _ = self.dispatch_js_event_at("change", f, None);
+                }
                 self.relayout();
                 true
             }
@@ -1833,6 +1945,12 @@ impl Browser {
                             page.dom.remove_attr(o, "selected");
                         }
                     }
+                }
+                #[cfg(feature = "page-js")]
+                {
+                    // Stepping the selection commits a value: input + change.
+                    let _ = self.dispatch_js_event_at("input", f, None);
+                    let _ = self.dispatch_js_event_at("change", f, None);
                 }
                 self.relayout();
                 true
@@ -1885,9 +2003,45 @@ impl Browser {
     }
 
     /// Fetch + engine pipeline + publish. The URL is already normalized.
+    ///
+    /// Phase 0: when the host opted into background fetches, http(s)
+    /// document loads submit to the shared kitae_net pool and return at
+    /// once — `poll_fetches` finishes them. Every other scheme needs no
+    /// network thread (`about:`/`file:`/`data:` are local synthesis or
+    /// disk reads) and keeps the inline path; POST form submits stay
+    /// synchronous too.
     fn load(&mut self, url: &str) {
         let pw = self.qtsq_password.clone();
-        self.load_with_password(url, pw.as_ref().map(|z| z.as_str()));
+        let networked = url.starts_with("http://") || url.starts_with("https://");
+        if self.background_fetch && networked {
+            self.begin_background_load(url, pw.as_ref().map(|z| z.as_str()));
+        } else {
+            self.load_with_password(url, pw.as_ref().map(|z| z.as_str()));
+        }
+    }
+
+    /// Everything a fresh top-level load resets before the pipeline runs:
+    /// the loading flag plus the per-page interaction state — focus,
+    /// hover, active, selection, caret, composition, the transport
+    /// mirror, find matches, and any pending sign-in prompt (H6: it must
+    /// never answer for a different page).
+    fn begin_load_reset(&mut self) {
+        self.host.set_loading(true);
+        #[cfg(feature = "page-js")]
+        {
+            self.page_js = None; // a new page gets a fresh runtime
+        }
+        self.focused = None;
+        self.hover = None;
+        self.active = None;
+        self.selection = None;
+        self.caret = None;
+        self.selection_range = None;
+        self.composition = None;
+        self.media_session = (false, 0.0);
+        self.find_active = None;
+        self.find_matches.clear();
+        self.pending_auth = None;
     }
 
     /// [`Self::load`] with an explicit password override (the QTSQ unlock
@@ -1902,20 +2056,8 @@ impl Browser {
         // (and `app_click`), and address-bar / back-forward / reload are
         // user actions, so a `file://` target typed or revisited works.
         kitae_net::set_page_origin(url);
-        self.host.set_loading(true);
-        self.focused = None;
-        self.hover = None;
-        self.active = None;
-        self.selection = None;
-        self.caret = None;
-        self.selection_range = None;
-        self.composition = None;
-        self.media_session = (false, 0.0);
+        self.begin_load_reset();
         let old_page_for_media = self.page_url.clone();
-        self.find_active = None;
-        self.find_matches.clear();
-        // H6: a sign-in prompt never answers for a different page.
-        self.pending_auth = None;
         let ((html, base_url), doc_base, outcome, locked, sig) = fetch_result_state(url, password);
         if let Err(FetchError::InsecureRedirect(target)) = &outcome {
             let target = target.clone();
@@ -1952,6 +2094,326 @@ impl Browser {
         // set_loading(false) — the embedder's loading-flag event must not
         // be delayed behind the autofill scan.
         self.notify_login_form();
+    }
+
+    /// Phase 0: submit an http(s) document fetch to the shared kitae_net
+    /// pool and return at once. The load reset runs now — a load in
+    /// flight must not keep the old page's interaction state — but the
+    /// displayed page stays live until the completion replays the
+    /// pipeline on [`Self::poll_fetches`]. Mid-flight link clicks gate
+    /// against the page actually on screen: the fetch job carries the
+    /// origin explicitly, and this thread's page-origin context still
+    /// names the old page until the completion installs the new one.
+    fn begin_background_load(&mut self, url: &str, password: Option<&str>) {
+        self.begin_load_reset();
+        let origin = self.gate_origin();
+        let id = kitae_net::pool::submit(url, &origin, kitae_net::pool::FetchJobKind::CachedGet);
+        self.pending_load = Some(PendingLoad {
+            id,
+            url: url.to_string(),
+            password: password.map(|p| zeroize::Zeroizing::new(p.to_string())),
+        });
+    }
+
+    /// Phase 0: apply one completed background load, if its response has
+    /// landed. Hosts call this from their idle tick (the C-ABI engine
+    /// every 2 ms; the Rust facade the same) so a pooled navigation
+    /// finishes at the next tick after the response arrives. Returns
+    /// whether a completion was applied. No-op while nothing is pending
+    /// or the fetch is still in flight.
+    ///
+    /// From the response onward this replays the synchronous load's
+    /// post-fetch sequence in full — download ownership, the 401 sign-in
+    /// prompt, the S-1 origin handoff, QTSQ release, `load_rendered`,
+    /// the loading flag and login-form autofill — so the visible outcome
+    /// is byte-identical to a synchronous load of the same response.
+    pub fn poll_fetches(&mut self) -> bool {
+        let Some(pf) = self.pending_load.take() else {
+            return false;
+        };
+        let mut landed = kitae_net::pool::take_results(&[pf.id]);
+        let Some(outcome) = landed.pop() else {
+            // Still fetching — leave it pending for the next tick.
+            self.pending_load = Some(pf);
+            return false;
+        };
+        // An InsecureRedirect handoff happens before everything else: the
+        // HTTP answer refuses to serve and points at the secure target
+        // (request_navigation re-pushes history — the one redirect case
+        // that adds an entry), so nothing of the redirecting fetch is
+        // applied.
+        if let Err(FetchError::InsecureRedirect(target)) = &outcome.result {
+            self.request_navigation(target.clone(), PendingHistory::Push);
+            return true;
+        }
+        let old_page_for_media = self.page_url.clone();
+        // H1: any download begun during the pooled fetch belongs to this
+        // browser.
+        for id in take_begun_downloads() {
+            self.download_owned.insert(id);
+        }
+        // H6: a 401 challenge becomes a sign-in page and an `auth\t`
+        // notification — the last challenge wins (one load presents one).
+        if let Some(prompt) = take_auth_challenges().pop() {
+            self.host.notify(&format!(
+                "auth\t{}\t{}\t{}",
+                prompt.scheme, prompt.realm, prompt.url
+            ));
+            self.pending_auth = Some(prompt);
+        }
+        // The render stage fetches this page's stylesheets, images and
+        // fonts on THIS thread, so from here on the S-1 context must name
+        // the page being loaded — as the synchronous path set it before
+        // its fetch. Until now the thread deliberately kept the displayed
+        // page's origin; the fetch ran origin-explicit on the pool worker.
+        kitae_net::set_page_origin(&pf.url);
+        release_qtsq_page_state(&old_page_for_media);
+        clear_web_media_for(&old_page_for_media);
+        let ((html, base_url), doc_base, render_outcome, locked, sig) = match outcome.result {
+            Ok(resp) => {
+                render_response_state(&pf.url, resp, pf.password.as_ref().map(|z| z.as_str()))
+            }
+            Err(e) => (
+                (error_page_html(&pf.url, &e.to_string()), pf.url.clone()),
+                None,
+                Err(e),
+                false,
+                QtsqSigState::Unsigned,
+            ),
+        };
+        self.load_rendered(
+            html,
+            &base_url,
+            doc_base.as_deref(),
+            &pf.url,
+            render_outcome,
+            locked,
+            sig,
+        );
+        self.host.set_loading(false);
+        self.notify_login_form();
+        true
+    }
+
+    /// Phase 0: turn background fetches (pool-riding top-level http(s)
+    /// loads finished on `poll_fetches`) on or off. Hosts set the mode at
+    /// construction, before navigating; flipping it mid-navigation with a
+    /// load already pooled leaves that load to complete on the next poll.
+    pub fn set_background_fetch(&mut self, on: bool) {
+        self.background_fetch = on;
+    }
+
+    /// SCRIPTING_DECISION.md: enable page JavaScript (feature `page-js`).
+    /// Off by default; setting it applies to the NEXT load. The runtime
+    /// lives one page: every navigation rebuilds or drops it.
+    pub fn set_page_js(&mut self, on: bool) {
+        self.page_js_enabled = on;
+        #[cfg(feature = "page-js")]
+        {
+            if !on {
+                self.page_js = None;
+            }
+        }
+    }
+
+    /// SCRIPTING_DECISION.md: hit-resolve a click against display-list
+    /// rects (last-painted wins) and dispatch it to the page's JS
+    /// listeners. True when a listener called `preventDefault()` — the
+    /// engine's default action (links, summary toggles, form controls)
+    /// must then stand down. A click that merely *fired* listeners does
+    /// not own anything: default actions proceed.
+    #[cfg(feature = "page-js")]
+    fn dispatch_page_js_click(&mut self, x: f32, y: f32) -> bool {
+        // Among every box and text run under the point, the smallest one
+        // is the most intimate target (a parent's background also contains
+        // the point, and rect order is not a reliable paint stack). Text
+        // has no box of its own — runs contribute their line box so a
+        // click on an anchor's label lands on the anchor, not the body.
+        let mut target: Option<(f32, u32)> = None;
+        if let Some(dl) = self.last_dl.as_ref() {
+            for r in &dl.rects {
+                if r.w > 0.0
+                    && r.h > 0.0
+                    && x >= r.x
+                    && x <= r.x + r.w
+                    && y >= r.y
+                    && y <= r.y + r.h
+                {
+                    let area = r.w * r.h;
+                    if target.is_none_or(|(best, _)| area <= best) {
+                        target = Some((area, r.node));
+                    }
+                }
+            }
+            for t in &dl.texts {
+                let (ascent, descent) =
+                    self.measurer.metrics_family(t.size, t.monospace, &t.family);
+                let (top, bot) = (t.y - ascent, t.y + descent);
+                if y < top || y > bot {
+                    continue;
+                }
+                let w = self.measurer.measure_family(
+                    &t.text,
+                    t.size,
+                    t.weight,
+                    t.italic,
+                    t.monospace,
+                    &t.family,
+                );
+                if x < t.x || x > t.x + w {
+                    continue;
+                }
+                let area = w * (bot - top);
+                if target.is_none_or(|(best, _)| area <= best) {
+                    target = Some((area, t.node));
+                }
+            }
+        }
+        let Some(target) = target.map(|(_, node)| node) else {
+            return false;
+        };
+        let Some(page) = self.page_js.as_mut() else {
+            return false;
+        };
+        // Display-list rects carry NodeIds; JS dispatch speaks tokens.
+        // They are different spaces (small colliding integers) — convert
+        // through the page's mint, never cast.
+        let token = page.token_for_node(NodeId(target));
+        let mut page_struct = self.page.take();
+        let (_, dirty, prevented) = match page_struct.as_mut() {
+            Some(p) => page.dispatch_click(&mut p.dom, token, x, y),
+            None => page.dispatch_click(&mut Dom::new(), token, x, y),
+        };
+        if let Some(p) = page_struct {
+            self.page = Some(p);
+        }
+        if dirty {
+            self.relayout();
+        }
+        prevented
+    }
+
+    /// page-js: one named event at `node`'s token through the page's
+    /// capture/bubble walk; relayout when listeners mutated the DOM.
+    /// True when a listener called preventDefault() (meaningful for
+    /// cancelable types only).
+    #[cfg(feature = "page-js")]
+    fn dispatch_js_event_at(&mut self, type_name: &str, node: NodeId, data: Option<&str>) -> bool {
+        let Some(js) = self.page_js.as_mut() else {
+            return false;
+        };
+        let token = js.token_for_node(node);
+        let mut page_struct = self.page.take();
+        let (_, dirty, prevented) = match page_struct.as_mut() {
+            Some(p) => js.dispatch_element_event(&mut p.dom, type_name, token, data),
+            None => js.dispatch_element_event(&mut Dom::new(), type_name, token, data),
+        };
+        if let Some(p) = page_struct {
+            self.page = Some(p);
+        }
+        if dirty {
+            self.relayout();
+        }
+        prevented
+    }
+
+    /// page-js: an engine-side edit of `node`'s value announces itself —
+    /// keydown/input/keyup reach the page's listeners. Informational: the
+    /// engine owns the caret, so preventDefault cannot un-type in v0.
+    #[cfg(feature = "page-js")]
+    fn dispatch_js_edit_events(&mut self, node: NodeId, text: &str) {
+        if !self.page_js_enabled || self.page_js.is_none() {
+            return;
+        }
+        for (type_name, data) in [("keydown", None), ("input", Some(text)), ("keyup", None)] {
+            let _ = self.dispatch_js_event_at(type_name, node, data);
+        }
+    }
+
+    /// Drain the page's script event loop (timers, settled fetches,
+    /// queued navigations). Hosts call this from their idle tick next to
+    /// `poll_fetches`. Returns whether the DOM mutated (the page is then
+    /// restyled, relaid out and republished).
+    pub fn poll_page_js(&mut self) -> bool {
+        #[cfg(feature = "page-js")]
+        {
+            if !self.page_js_enabled {
+                return false;
+            }
+            let mut mutated = false;
+            if let Some(url) = self.page_js.as_mut().and_then(|p| p.take_pending_nav()) {
+                if url == "kitae:reload" {
+                    self.reload();
+                } else if url == "kitae:back" {
+                    self.go(-1);
+                } else if url == "kitae:forward" {
+                    self.go(1);
+                } else {
+                    self.request_navigation(url, PendingHistory::Push);
+                }
+                return true; // navigation owns the next frames
+            }
+            // history.pushState/replaceState: URL-only state moves — the
+            // page keeps its document, the address bar follows.
+            if let Some((url, _replace)) =
+                self.page_js.as_mut().and_then(|p| p.take_pending_history())
+            {
+                self.page_url = url.clone();
+                self.host.location_changed(&url);
+                return false;
+            }
+            // Script-requested scroll (window.scrollTo/scrollBy,
+            // element.scrollIntoView) — clamped like every other scroll
+            // path, and the host is told to repaint.
+            if let Some(y) = self.page_js.as_ref().and_then(|p| p.take_pending_scroll()) {
+                self.set_scroll(y);
+                self.publish_page_js_view();
+            }
+            // Script-requested focus (element.focus()/blur()).
+            if let Some(req) = self.page_js.as_ref().and_then(|p| p.take_pending_focus()) {
+                let node =
+                    req.and_then(|t| self.page_js.as_ref().and_then(|p| p.node_for_token(t)));
+                self.focus_node_inner(node);
+            }
+            // A back/forward load completed: the NEW document's listeners
+            // see `popstate` (state is null — a reload resets it).
+            if let Some(target) = self.pending_popstate.clone() {
+                if self.page_url == target && self.page_js.is_some() {
+                    self.pending_popstate = None;
+                    let mut page_struct = self.page.take();
+                    if let Some(p) = page_struct.as_mut() {
+                        if let Some(js) = self.page_js.as_mut() {
+                            let _ = js.dispatch_doc_event(&mut p.dom, "popstate", 0.0, 0.0);
+                        }
+                    }
+                    if let Some(p) = page_struct {
+                        self.page = Some(p);
+                    }
+                    mutated = true;
+                }
+            }
+            if self.page_js.is_some() && self.page.is_some() {
+                let mut page = self.page.take().unwrap();
+                mutated |= self.page_js.as_mut().unwrap().poll(&mut page.dom);
+                self.page = Some(page);
+            }
+            for line in self
+                .page_js
+                .as_ref()
+                .map(|p| p.take_console())
+                .unwrap_or_default()
+            {
+                self.host.notify(&format!("console\t{line}"));
+            }
+            if mutated {
+                self.relayout();
+            }
+            mutated
+        }
+        #[cfg(not(feature = "page-js"))]
+        {
+            false
+        }
     }
 
     /// H6: the host's answer to an `auth\t` notification — remember the
@@ -2286,20 +2748,27 @@ impl Browser {
             app = Some(a);
             html = start_page_html(); // canonical HTML copy for save/archive
         } else {
-            let (d, r, s) = prepare_in_env(&html, doc_base, self.viewport_w, &self.environment);
-            dom = d;
-            root = r;
-            styles = s;
-            title = root.and_then(|r| page_title(&dom, r)).unwrap_or_default();
-            // Phase 2 (`live`): a page served by a kitae_live server marks
-            // itself with <meta name="kitae-live">. The static page is
-            // fully rendered above; the LiveApp opens the socket on its
-            // first poll and applies hydration patches + streamed updates.
-            #[cfg(feature = "live")]
-            if self.live_enabled && root.is_some() && outcome.is_ok() && is_live_page(&dom) {
-                let body = find_element(&dom, root.unwrap(), "body");
-                if let Some(body) = body {
-                    live = Some(live::LiveApp::new(url, body));
+            if let Some((d, r, s, t)) = self.try_render_with_page_js(&html, doc_base) {
+                dom = d;
+                root = r;
+                styles = s;
+                title = t;
+            } else {
+                let (d, r, s) = prepare_in_env(&html, doc_base, self.viewport_w, &self.environment);
+                dom = d;
+                root = r;
+                styles = s;
+                title = root.and_then(|r| page_title(&dom, r)).unwrap_or_default();
+                // Phase 2 (`live`): a page served by a kitae_live server marks
+                // itself with <meta name="kitae-live">. The static page is
+                // fully rendered above; the LiveApp opens the socket on its
+                // first poll and applies hydration patches + streamed updates.
+                #[cfg(feature = "live")]
+                if self.live_enabled && root.is_some() && outcome.is_ok() && is_live_page(&dom) {
+                    let body = find_element(&dom, root.unwrap(), "body");
+                    if let Some(body) = body {
+                        live = Some(live::LiveApp::new(url, body));
+                    }
                 }
             }
         }
@@ -2344,6 +2813,50 @@ impl Browser {
         self.ensure_page_fonts();
         self.relayout();
         self.host.set_loading(false);
+    }
+
+    /// SCRIPTING_DECISION.md: the page-js render path. Parses the page,
+    /// runs its scripts (inline + external, document order) against the
+    /// DOM shim, then computes styles/layout from the *mutated* tree.
+    /// `None` hands control back to the no-JS path: page JS disabled, a
+    /// frameless document, or a page whose scripts all failed while the
+    /// body stayed empty — the honest interstitial policy then applies,
+    /// exactly as with scripts declined.
+    /// Without the `page-js` feature nothing can render scripts: always
+    /// take the no-JS path.
+    #[cfg(not(feature = "page-js"))]
+    fn try_render_with_page_js(
+        &mut self,
+        _html: &str,
+        _doc_base: &str,
+    ) -> Option<(Dom, Option<NodeId>, Vec<(NodeId, ComputedStyle)>, String)> {
+        None
+    }
+
+    #[cfg(feature = "page-js")]
+    fn try_render_with_page_js(
+        &mut self,
+        html: &str,
+        doc_base: &str,
+    ) -> Option<(Dom, Option<NodeId>, Vec<(NodeId, ComputedStyle)>, String)> {
+        if !self.page_js_enabled {
+            return None;
+        }
+        let (mut dom, root) = parse(html);
+        let root = root?;
+        let mut page = pagejs::JsPage::new(doc_base, self.storage_session).ok()?;
+        let stats = page.run_document_scripts(&mut dom, root, doc_base);
+        // Scripts ran: with page JS on, the noscript fallback no longer
+        // preempts the page (that content is for script-less engines).
+        // Failed scripts + a body that stays text-thin keeps the honest
+        // no-JS outcome: the caller's interstitial policy applies.
+        if stats.scripts_ok + stats.modules_ok == 0 && needs_interstitial(&dom, root) {
+            return None;
+        }
+        let styles = self.styles_for_dom(&dom, doc_base);
+        let title = page_title(&dom, root).unwrap_or_default();
+        self.page_js = Some(page);
+        Some((dom, Some(root), styles, title))
     }
 
     /// Lay out the current document at the current viewport width and publish.
@@ -2593,6 +3106,12 @@ impl Browser {
         // and fall back to the element's `poster` while no video data
         // exists.
         for im in &mut dl.images {
+            // A canvas re-stamps on every relayout: the sentinel never
+            // changes, but the registered pixels do (page JS drew again).
+            if im.src.starts_with("\u{0}canvas:") {
+                im.payload = qtsq_raster_for_url(&im.src).map(|r| r.id);
+                continue;
+            }
             if im.payload.is_none() {
                 if let Some(id) = im.src.strip_prefix("\u{0}media:") {
                     // The sentinel id pairs with `dl.media[id]`, whose src
@@ -2709,6 +3228,40 @@ impl Browser {
         self.sync_display_media_state(&mut dl);
         self.host.publish(&self.state(), &self.decorate_caret(&dl));
         self.last_dl = Some(dl);
+        // page-js geometry: publish node boxes + viewport so scripts can
+        // answer getBoundingClientRect/innerWidth from the rendered truth.
+        #[cfg(feature = "page-js")]
+        if let Some(js) = self.page_js.as_ref() {
+            if let Some(dl) = self.last_dl.as_ref() {
+                let mut rects: std::collections::HashMap<u32, (f32, f32, f32, f32)> =
+                    std::collections::HashMap::new();
+                for r in &dl.rects {
+                    let entry = rects.entry(r.node).or_insert((r.x, r.y, r.w, r.h));
+                    let x0 = entry.0.min(r.x);
+                    let y0 = entry.1.min(r.y);
+                    let x1 = (entry.0 + entry.2).max(r.x + r.w);
+                    let y1 = (entry.1 + entry.3).max(r.y + r.h);
+                    *entry = (x0, y0, x1 - x0, y1 - y0);
+                }
+                js.set_geometry(rects, (self.viewport_w, self.viewport_h));
+                // JS-3 read paths: scroll / activeElement / selection and
+                // the computed-style text ride the same publish cadence.
+                self.publish_page_js_view();
+                if let Some(js) = self.page_js.as_ref() {
+                    let computed = self
+                        .page
+                        .as_ref()
+                        .map(|p| {
+                            p.styles
+                                .iter()
+                                .map(|(n, s)| (n.0, pagejs::computed_css(s)))
+                                .collect::<std::collections::HashMap<u32, String>>()
+                        })
+                        .unwrap_or_default();
+                    js.set_computed(computed);
+                }
+            }
+        }
     }
 
     fn styles_for_dom(&self, dom: &Dom, base_url: &str) -> Vec<(NodeId, ComputedStyle)> {
@@ -2716,8 +3269,10 @@ impl Browser {
         engine.compute_with_state(dom, &self.interaction_state())
     }
 
-    /// Dynamic pseudo-class state for the style engine (slice N6).
-    fn interaction_state(&self) -> kitae_style::InteractionState {
+    /// Dynamic pseudo-class state for the style engine (slice N6), and the
+    /// state an element query must pass so `:hover`/`:focus` selectors
+    /// answer truthfully.
+    pub fn interaction_state(&self) -> kitae_style::InteractionState {
         kitae_style::InteractionState {
             hover: self.hover,
             active: self.active,
@@ -3242,15 +3797,23 @@ impl Browser {
         let Some(node) = self.handle_node(handle) else {
             return false;
         };
+        self.focus_node_inner(Some(node))
+    }
+
+    /// Focus `node` (None = blur), shared by the handle path above and
+    /// page-js `element.focus()`/`blur()` requests. False when the node is
+    /// not focusable (or there is no page) — blur always applies.
+    fn focus_node_inner(&mut self, node: Option<NodeId>) -> bool {
         let Some(page) = self.page.as_ref() else {
             return false;
         };
-        let focusable = self.is_focusable_node(&page.dom, &page.styles, node);
-        if !focusable {
-            return false;
+        if let Some(n) = node {
+            if !self.is_focusable_node(&page.dom, &page.styles, n) {
+                return false;
+            }
         }
         let canceled = self.reset_editing_for_focus();
-        self.focused = Some(node);
+        self.focused = node;
         self.sync_caret();
         self.refresh_ax_focus();
         if canceled {
@@ -3840,6 +4403,10 @@ impl Browser {
             // Sentinels re-step on every republish (that is the whole point
             // of the pixel swap); other images only stamp when unresolved.
             let is_sentinel = im.src.starts_with("\u{0}media:");
+            if im.src.starts_with("\u{0}canvas:") {
+                im.payload = qtsq_raster_for_url(&im.src).map(|r| r.id);
+                continue;
+            }
             if is_sentinel || im.payload.is_none() {
                 if is_sentinel {
                     let id = im.src.trim_start_matches("\u{0}media:");
@@ -3874,6 +4441,23 @@ impl Browser {
         self.sync_display_media_state(&mut dl);
         self.host.publish(&self.state(), &self.decorate_caret(&dl));
         self.last_dl = Some(dl);
+        // page-js view state (scroll/activeElement/getSelection) is cheap
+        // and must never be stale after a caret repaint or a script-driven
+        // scroll — styles/geometry refresh stays on the relayout cadence.
+        #[cfg(feature = "page-js")]
+        self.publish_page_js_view();
+    }
+
+    /// Refresh the JS-3 view state a page script can read.
+    #[cfg(feature = "page-js")]
+    fn publish_page_js_view(&mut self) {
+        if let Some(js) = self.page_js.as_ref() {
+            js.set_view_state(
+                (0.0, self.scroll_y),
+                self.focused.map(|n| n.0),
+                self.selection.clone().unwrap_or_default(),
+            );
+        }
     }
 
     fn sync_display_media_state(&self, dl: &mut DisplayList) {
@@ -5354,6 +5938,14 @@ impl Browser {
             if self.focused == Some(node) {
                 self.caret = Some(value.chars().count());
             }
+            // A select's value only moves by user choice (the host's
+            // dropdown reports through here): that commit fires input +
+            // change. Text fields set from the host are programmatic.
+            #[cfg(feature = "page-js")]
+            if tag == "select" {
+                let _ = self.dispatch_js_event_at("input", node, None);
+                let _ = self.dispatch_js_event_at("change", node, None);
+            }
             self.relayout();
         }
         ok
@@ -5389,6 +5981,41 @@ impl Browser {
         true
     }
 
+    /// Replace the value of a control addressed by **node**, id or not: the
+    /// node-keyed form of [`Self::set_input_value`], used by the agent
+    /// plane's `fill` (a selector resolves to a node, and the element it
+    /// points at need not carry an `id`). Writes through the same
+    /// `write_control_value` path as typing, so the DOM, the caret and the
+    /// `input`/`change` events all agree with what a person would see.
+    pub fn set_control_value_for_node(&mut self, node: NodeId, value: &str) -> bool {
+        if self.page.is_none() {
+            return false;
+        }
+        let tag = self.page.as_ref().map(|p| p.dom.tag(node).to_string());
+        let Some(tag) = tag else { return false };
+        // Checkbox/radio controls want `checked`, which the value writer
+        // handles; everything else is a text-ish write.
+        if !matches!(tag.as_str(), "input" | "textarea" | "select") {
+            return false;
+        }
+        let editable = {
+            let page = self.page.as_ref().unwrap();
+            self.is_editable_node(&page.dom, node)
+        };
+        if !matches!(tag.as_str(), "select") && !editable {
+            return false;
+        }
+        if self.write_control_value(node, value) {
+            self.caret = Some(value.chars().count());
+            self.relayout();
+            #[cfg(feature = "page-js")]
+            self.dispatch_js_edit_events(node, value);
+            true
+        } else {
+            false
+        }
+    }
+
     /// Insert `text` at the caret of the focused editable control (A11a).
     /// The caret defaults to the end of the value when unset — so focusing
     /// a control and typing appends, matching the pre-caret contract — and
@@ -5413,6 +6040,8 @@ impl Browser {
         self.selection = None;
         self.caret = Some(start + text.chars().count());
         self.relayout();
+        #[cfg(feature = "page-js")]
+        self.dispatch_js_edit_events(node, text);
         true
     }
 
@@ -5516,8 +6145,14 @@ impl Browser {
     }
 
     pub fn form_data(&self, form_id: &str) -> Option<Vec<(String, String)>> {
+        let form = self.page.as_ref()?.dom.get_element_by_id(form_id)?;
+        self.form_data_for_node(form)
+    }
+
+    /// [`Self::form_data`] keyed by node: the agent plane resolves a
+    /// selector to a node, and a form it fills need not carry an `id`.
+    pub fn form_data_for_node(&self, form: NodeId) -> Option<Vec<(String, String)>> {
         let page = self.page.as_ref()?;
-        let form = page.dom.get_element_by_id(form_id)?;
         if page.dom.tag(form) != "form" {
             return None;
         }
@@ -5605,10 +6240,19 @@ impl Browser {
     /// Same predicate the `:invalid` pseudo-class uses, so the UI and the
     /// submit gate can never disagree.
     pub fn form_failures(&self, form_id: &str) -> Vec<NodeId> {
-        let Some(page) = self.page.as_ref() else {
+        let Some(form) = self
+            .page
+            .as_ref()
+            .and_then(|p| p.dom.get_element_by_id(form_id))
+        else {
             return Vec::new();
         };
-        let Some(form) = page.dom.get_element_by_id(form_id) else {
+        self.form_failures_for_node(form)
+    }
+
+    /// [`Self::form_failures`] keyed by node.
+    pub fn form_failures_for_node(&self, form: NodeId) -> Vec<NodeId> {
+        let Some(page) = self.page.as_ref() else {
             return Vec::new();
         };
         if page.dom.tag(form) != "form" {
@@ -5633,8 +6277,13 @@ impl Browser {
     /// the file's bytes, basenames and a sniffed content type. Returns the
     /// full `multipart/form-data; boundary=…` header value plus the body.
     pub fn multipart_body(&self, form_id: &str) -> Option<(String, Vec<u8>)> {
+        let form = self.page.as_ref()?.dom.get_element_by_id(form_id)?;
+        self.multipart_body_for_node(form)
+    }
+
+    /// [`Self::multipart_body`] keyed by node.
+    pub fn multipart_body_for_node(&self, form: NodeId) -> Option<(String, Vec<u8>)> {
         let page = self.page.as_ref()?;
-        let form = page.dom.get_element_by_id(form_id)?;
         if page.dom.tag(form) != "form" {
             return None;
         }
@@ -5786,9 +6435,32 @@ impl Browser {
     }
 
     pub fn submit_form(&mut self, form_id: &str) -> Option<String> {
+        let form = self
+            .page
+            .as_ref()
+            .and_then(|p| p.dom.get_element_by_id(form_id))?;
+        self.submit_form_for_node(form)
+    }
+
+    /// [`Self::submit_form`] keyed by node — the agent plane's `submit`
+    /// resolves a selector to a node, and a form need not carry an `id`.
+    /// One behavioural note: the H6 password-save prompt is keyed by
+    /// element id (it feeds the host's keychain flow), so a form without an
+    /// id submits without offering that prompt. Nothing about the
+    /// submission itself depends on the id.
+    pub fn submit_form_for_node(&mut self, form: NodeId) -> Option<String> {
+        // page-js: the page's own `submit` listeners run first; a
+        // preventDefault() hands the submission to the script — the engine
+        // performs no navigation.
+        #[cfg(feature = "page-js")]
+        if self.page_js_enabled
+            && self.page_js.is_some()
+            && self.dispatch_js_event_at("submit", form, None)
+        {
+            return None;
+        }
         let (action, method, enctype) = {
             let page = self.page.as_ref()?;
-            let form = page.dom.get_element_by_id(form_id)?;
             if page.dom.tag(form) != "form" {
                 return None;
             }
@@ -5810,7 +6482,7 @@ impl Browser {
         // A10: constraint validation blocks the submit. Invalid controls
         // get focus (first failure) so the host can show where; the relayout
         // repaints them with the `input:invalid` UA border.
-        let failures = self.form_failures(form_id);
+        let failures = self.form_failures_for_node(form);
         if !failures.is_empty() {
             self.reset_editing_for_focus();
             self.focused = Some(failures[0]);
@@ -5819,9 +6491,19 @@ impl Browser {
             return None;
         }
         // H6: a filled password input in a submitting form offers the host
-        // a save — before the navigation wipes the page's values.
-        self.notify_password_save(form_id);
-        let data = self.form_data(form_id).unwrap_or_default();
+        // a save — before the navigation wipes the page's values. Id-keyed
+        // (see the note above); skipped when the form has no id.
+        let id = self
+            .page
+            .as_ref()
+            .and_then(|p| p.dom.element(form))
+            .and_then(|e| e.attr("id"))
+            .unwrap_or("")
+            .to_string();
+        if !id.is_empty() {
+            self.notify_password_save(&id);
+        }
+        let data = self.form_data_for_node(form).unwrap_or_default();
         let encoded = data
             .iter()
             .map(|(k, v)| {
@@ -5845,7 +6527,7 @@ impl Browser {
         };
         if method == "post" {
             if enctype.starts_with("multipart/") {
-                if let Some((content_type, body)) = self.multipart_body(form_id) {
+                if let Some((content_type, body)) = self.multipart_body_for_node(form) {
                     return self.submit_post_bytes(&base, &body, &content_type);
                 }
             }
@@ -6078,6 +6760,12 @@ impl Browser {
                         }
                         page.dom.set_attr(f, "checked", "");
                     }
+                }
+                #[cfg(feature = "page-js")]
+                {
+                    // A toggle commits the control's state: input + change.
+                    let _ = self.dispatch_js_event_at("input", f, None);
+                    let _ = self.dispatch_js_event_at("change", f, None);
                 }
                 self.relayout();
                 true
@@ -9365,6 +10053,15 @@ fn ensure_web_raster(url: &str) -> Option<QtsqRaster> {
     if let Some(hit) = qtsq_raster_for_url(url) {
         return Some(hit);
     }
+    // Inline `data:` payloads decode from the URL itself, no fetch. The
+    // canvas tier leans on this: `toDataURL()` output (a PNG data URL)
+    // goes straight back into an `<img src>` or a `drawImage`. QTSQ and
+    // SVG payloads were claimed earlier in the chain.
+    if url.starts_with("data:") {
+        let (mime, bytes) = data_url_bytes(url)?;
+        let img = decode_image(&bytes, Some(&mime)).ok()?;
+        return Some(qtsq_register_raster(url, img.width, img.height, img.pixels));
+    }
     let resp = fetch_cached(url).ok()?;
     if resp.status >= 400 {
         return None;
@@ -9491,6 +10188,65 @@ fn b64_decode(s: &str) -> Option<Vec<u8>> {
         }
     }
     Some(out)
+}
+
+/// The MIME type and bytes of a `data:` URL payload. Base64 payloads
+/// decode directly; anything else is percent-decoded (the form inline SVG
+/// and other text payloads use).
+fn data_url_bytes(url: &str) -> Option<(String, Vec<u8>)> {
+    let rest = url.strip_prefix("data:")?;
+    let (meta, payload) = rest.split_once(',')?;
+    let mime = meta.split(';').next().unwrap_or("").to_string();
+    let bytes: Vec<u8> = if meta.ends_with(";base64") {
+        b64_decode(payload)?
+    } else {
+        let raw = payload.as_bytes();
+        let mut out = Vec::with_capacity(raw.len());
+        let mut i = 0;
+        while i < raw.len() {
+            if raw[i] == b'%' && i + 2 < raw.len() {
+                let hex = |c: u8| (c as char).to_digit(16).map(|d| d as u8);
+                if let (Some(hi), Some(lo)) = (hex(raw[i + 1]), hex(raw[i + 2])) {
+                    out.push(hi * 16 + lo);
+                    i += 3;
+                    continue;
+                }
+            }
+            out.push(raw[i]);
+            i += 1;
+        }
+        out
+    };
+    Some((mime, bytes))
+}
+
+/// Standard base64 (RFC 4648, `=`-padded). The canvas bridge carries pixel
+/// buffers in both directions as text — one allocation per frame instead of
+/// a per-byte JS-to-Rust conversion.
+fn b64_encode(bytes: &[u8]) -> String {
+    const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::with_capacity(bytes.len().div_ceil(3) * 4);
+    for chunk in bytes.chunks(3) {
+        let b = [
+            chunk[0],
+            *chunk.get(1).unwrap_or(&0),
+            *chunk.get(2).unwrap_or(&0),
+        ];
+        let n = ((b[0] as u32) << 16) | ((b[1] as u32) << 8) | b[2] as u32;
+        out.push(ALPHABET[(n >> 18) as usize & 63] as char);
+        out.push(ALPHABET[(n >> 12) as usize & 63] as char);
+        out.push(if chunk.len() > 1 {
+            ALPHABET[(n >> 6) as usize & 63] as char
+        } else {
+            '='
+        });
+        out.push(if chunk.len() > 2 {
+            ALPHABET[n as usize & 63] as char
+        } else {
+            '='
+        });
+    }
+    out
 }
 
 /// B11: concatenate every text node under `node` — used to decide which
@@ -12439,6 +13195,1705 @@ div > p { text-decoration: underline }</style></head>\
         assert!(b.pending_navigation.is_none());
         assert!(b.history.is_empty());
         kitae_net::set_warn_insecure_http(false);
+    }
+
+    // ── Phase 0: background (pooled) top-level loads ────────────────────────
+
+    /// Serves `{path → (delay_ms, body)}` routes as text/html on a loopback
+    /// port, forever. Returns the base URL. The delay lets a test hold a
+    /// fetch in flight on the shared pool deterministically.
+    fn loopback_html_server(routes: Vec<(&'static str, u64, &'static str)>) -> String {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind loopback");
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        std::thread::spawn(move || {
+            for stream in listener.incoming().flatten() {
+                let mut stream = stream;
+                let mut buf = [0u8; 2048];
+                let n = stream.read(&mut buf).unwrap_or(0);
+                let head = String::from_utf8_lossy(&buf[..n]);
+                let path = head.split_whitespace().nth(1).unwrap_or("/").to_string();
+                let Some((delay, body)) = routes
+                    .iter()
+                    .find(|(p, _, _)| *p == path)
+                    .map(|(_, d, b)| (*d, *b))
+                else {
+                    let _ = stream.write_all(
+                        b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                    );
+                    continue;
+                };
+                if delay > 0 {
+                    std::thread::sleep(std::time::Duration::from_millis(delay));
+                }
+                let resp = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                let _ = stream.write_all(resp.as_bytes());
+            }
+        });
+        url
+    }
+
+    fn page_text_of(b: &Browser) -> String {
+        b.last_dl
+            .as_ref()
+            .map(|dl| {
+                dl.texts
+                    .iter()
+                    .map(|t| t.text.as_str())
+                    .collect::<Vec<_>>()
+                    .join(" ")
+            })
+            .unwrap_or_default()
+    }
+
+    /// Evaluate a pure-JS expression in the page's runtime, stringified on
+    /// the JS side so booleans and numbers read back as text.
+    #[cfg(feature = "page-js")]
+    fn read_js(b: &mut Browser, expr: &str) -> String {
+        b.page_js
+            .as_mut()
+            .and_then(|p| p.host_eval_for_test(&format!("'' + ({expr})")))
+            .unwrap_or_default()
+    }
+
+    /// A loopback server that also reads request bodies: known routes are
+    /// served as HTML, everything else answers 200 text/plain with
+    /// `[METHOD] <body>` echoed back. Records (method, path, content-type,
+    /// body) so POST tests can assert what went on the wire.
+    #[allow(clippy::type_complexity)]
+    fn loopback_echo_server(
+        routes: Vec<(&'static str, &'static str)>,
+    ) -> (
+        String,
+        std::sync::Arc<std::sync::Mutex<Vec<(String, String, String, String)>>>,
+    ) {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind loopback");
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let seen_thread = seen.clone();
+        std::thread::spawn(move || {
+            for stream in listener.incoming().flatten() {
+                let mut stream = stream;
+                let mut buf: Vec<u8> = Vec::new();
+                let mut tmp = [0u8; 2048];
+                let mut header_end = None;
+                while header_end.is_none() {
+                    let n = stream.read(&mut tmp).unwrap_or(0);
+                    if n == 0 {
+                        break;
+                    }
+                    buf.extend_from_slice(&tmp[..n]);
+                    header_end = buf.windows(4).position(|w| w == b"\r\n\r\n").map(|i| i + 4);
+                }
+                let head_end = header_end.unwrap_or(buf.len());
+                let head = String::from_utf8_lossy(&buf[..head_end]).to_string();
+                let mut lines = head.split("\r\n");
+                let request_line = lines.next().unwrap_or("").to_string();
+                let method = request_line
+                    .split_whitespace()
+                    .next()
+                    .unwrap_or("GET")
+                    .to_string();
+                let path = request_line
+                    .split_whitespace()
+                    .nth(1)
+                    .unwrap_or("/")
+                    .to_string();
+                let mut content_length = 0usize;
+                let mut content_type = String::new();
+                for line in lines {
+                    if let Some((k, v)) = line.split_once(':') {
+                        if k.eq_ignore_ascii_case("content-length") {
+                            content_length = v.trim().parse().unwrap_or(0);
+                        } else if k.eq_ignore_ascii_case("content-type") {
+                            content_type = v.trim().to_string();
+                        }
+                    }
+                }
+                let mut body = buf[head_end..].to_vec();
+                while body.len() < content_length {
+                    let n = stream.read(&mut tmp).unwrap_or(0);
+                    if n == 0 {
+                        break;
+                    }
+                    body.extend_from_slice(&tmp[..n]);
+                }
+                body.truncate(content_length);
+                let body = String::from_utf8_lossy(&body).to_string();
+                seen_thread.lock().unwrap().push((
+                    method.clone(),
+                    path.clone(),
+                    content_type,
+                    body.clone(),
+                ));
+                let (ctype, payload) = match routes.iter().find(|(p, _)| *p == path) {
+                    Some((_, html)) => ("text/html", (*html).to_string()),
+                    None => ("text/plain", format!("[{method}] {body}")),
+                };
+                let resp = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: {ctype}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{payload}",
+                    payload.len()
+                );
+                let _ = stream.write_all(resp.as_bytes());
+            }
+        });
+        (url, seen)
+    }
+
+    /// Drive `poll_fetches` until it applies the pending load, with a
+    /// deadline — the pool finishes real HTTP waits off this thread, so
+    /// the test polls like a host's idle tick does.
+    fn drain_until_completes(b: &mut Browser) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while !b.poll_fetches() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the pooled load never completed"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+    }
+
+    struct LoadingHost {
+        flags: std::sync::Arc<std::sync::Mutex<Vec<bool>>>,
+        frames: usize,
+    }
+
+    impl Host for LoadingHost {
+        fn publish(&mut self, _state: &PublicState, _dl: &DisplayList) {
+            self.frames += 1;
+        }
+        fn scroll_updated(&mut self, _state: &PublicState) {}
+        fn set_loading(&mut self, loading: bool) {
+            self.flags.lock().unwrap().push(loading);
+        }
+        fn open_external(&mut self, _url: &str) {}
+    }
+
+    #[test]
+    fn background_load_publishes_on_poll_fetches() {
+        let server = loopback_html_server(vec![(
+            "/doc",
+            60,
+            "<html><head><title>Pooled</title></head><body><h1>pooled body words</h1></body></html>",
+        )]);
+        let mut b = Browser::new(
+            Box::new(NullHost { frames: 0 }),
+            Box::new(ApproxMeasurer),
+            (400.0, 600.0),
+        );
+        b.set_background_fetch(true);
+        b.navigate(&format!("{server}/doc"));
+        // Submit semantics: the fetch is in flight, nothing rendered yet.
+        assert!(b.pending_load.is_some(), "a load rides the pool");
+        assert!(b.last_dl.is_none(), "no pipeline ran before the response");
+        drain_until_completes(&mut b);
+        // Completion semantics: full pipeline replay.
+        assert!(b.pending_load.is_none(), "the load is no longer pending");
+        assert_eq!(b.page_title, "Pooled");
+        assert_eq!(b.state().url, format!("{server}/doc"));
+        assert!(
+            page_text_of(&b).contains("pooled body words"),
+            "the fetched page rendered: {:?}",
+            page_text_of(&b)
+        );
+        // Quiescence: no second completion, no new work.
+        std::thread::sleep(std::time::Duration::from_millis(40));
+        assert!(!b.poll_fetches());
+        assert_eq!(b.page_title, "Pooled");
+    }
+
+    #[test]
+    fn default_mode_stays_synchronous() {
+        let server = loopback_html_server(vec![(
+            "/doc",
+            0,
+            "<html><body><p>inline body words</p></body></html>",
+        )]);
+        let mut b = Browser::new(
+            Box::new(NullHost { frames: 0 }),
+            Box::new(ApproxMeasurer),
+            (400.0, 600.0),
+        );
+        b.navigate(&format!("{server}/doc"));
+        // Without the mode flag nothing pooled: the page is fully rendered
+        // by the time navigate returns (the direct-API/test contract).
+        assert!(b.pending_load.is_none());
+        assert!(
+            page_text_of(&b).contains("inline body words"),
+            "synchronous load rendered: {:?}",
+            page_text_of(&b)
+        );
+    }
+
+    #[test]
+    fn local_schemes_stay_inline_in_background_mode() {
+        let dir = std::env::temp_dir().join(format!("kitae_bg_local_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("mkdir");
+        let page = dir.join("local.html");
+        std::fs::write(&page, "<html><body><p>local file words</p></body></html>").expect("write");
+        let mut b = Browser::new(
+            Box::new(NullHost { frames: 0 }),
+            Box::new(ApproxMeasurer),
+            (400.0, 600.0),
+        );
+        b.set_background_fetch(true);
+        b.navigate(&format!("file://{}", page.display()));
+        assert!(b.pending_load.is_none(), "file:// never enters the pool");
+        assert!(page_text_of(&b).contains("local file words"));
+        b.navigate("about:blank");
+        assert!(b.pending_load.is_none(), "about: never enters the pool");
+        let _ = page_text_of(&b);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn superseded_loads_cannot_apply() {
+        let server = loopback_html_server(vec![
+            (
+                "/slow-a",
+                220,
+                "<html><body><p>first page words</p></body></html>",
+            ),
+            (
+                "/b",
+                0,
+                "<html><body><p>second page words</p></body></html>",
+            ),
+        ]);
+        let mut b = Browser::new(
+            Box::new(NullHost { frames: 0 }),
+            Box::new(ApproxMeasurer),
+            (400.0, 600.0),
+        );
+        b.set_background_fetch(true);
+        b.navigate(&format!("{server}/slow-a"));
+        b.navigate(&format!("{server}/b"));
+        assert!(
+            b.history.len() == 2,
+            "history pushes stay synchronous: {:?}",
+            b.history
+        );
+        drain_until_completes(&mut b);
+        let text = page_text_of(&b);
+        assert!(
+            text.contains("second page words"),
+            "the newer load wins: {:?}",
+            text
+        );
+        // Quiescence: the abandoned slow load's late completion (if it
+        // even arrived) must stay unclaimed — the page still shows B.
+        std::thread::sleep(std::time::Duration::from_millis(120));
+        assert!(!b.poll_fetches());
+        assert!(page_text_of(&b).contains("second page words"));
+    }
+
+    // ── SCRIPTING_DECISION.md: page JavaScript (feature page-js) ──────────
+
+    #[cfg(feature = "page-js")]
+    fn js_browser() -> Browser {
+        let mut b = Browser::new(
+            Box::new(NullHost { frames: 0 }),
+            Box::new(ApproxMeasurer),
+            (400.0, 600.0),
+        );
+        b.set_page_js(true);
+        b
+    }
+
+    #[cfg(feature = "page-js")]
+    #[test]
+    fn page_js_renders_scripted_content() {
+        let mut b = js_browser();
+        b.load_html(
+            "<html><body><p id=\"x\"></p><script>\
+             document.getElementById('x').textContent = 'scripted words';\
+             </script></body></html>",
+            "https://example.test/js",
+        );
+        // The pipeline ran on the MUTATED tree: layout paints what the
+        // script produced, not the empty paragraph.
+        assert!(
+            page_text_of(&b).contains("scripted words"),
+            "scripted content rendered: {:?}",
+            page_text_of(&b)
+        );
+    }
+
+    #[cfg(feature = "page-js")]
+    #[test]
+    fn page_js_off_by_default() {
+        let mut b = Browser::new(
+            Box::new(NullHost { frames: 0 }),
+            Box::new(ApproxMeasurer),
+            (400.0, 600.0),
+        );
+        b.set_page_js(false);
+        b.load_html(
+            "<html><body><p id=\"x\"></p><script>\
+             document.getElementById('x').textContent = 'never runs';\
+             </script></body></html>",
+            "https://example.test/nojs",
+        );
+        assert!(
+            !page_text_of(&b).contains("never runs"),
+            "script output must not render without the opt-in"
+        );
+    }
+
+    #[cfg(feature = "page-js")]
+    #[test]
+    fn page_js_all_failed_but_textful_renders_statically() {
+        let mut b = js_browser();
+        b.load_html(
+            "<html><body><p>plenty of static words survive here</p><script>broken {{</script></body></html>",
+            "https://example.test/fail",
+        );
+        assert!(
+            page_text_of(&b).contains("plenty of static words"),
+            "static content survives syntax failures"
+        );
+    }
+
+    #[cfg(feature = "page-js")]
+    #[test]
+    fn page_js_failing_only_scripts_fall_back_to_interstitial() {
+        let server = loopback_html_server(vec![(
+            "/shell",
+            0,
+            "<html><body><div id=\"app\"></div><script>a {{</script><script>b {{</script></body></html>",
+        )]);
+        let mut b = js_browser();
+        b.navigate(&format!("{server}/shell"));
+        assert_eq!(
+            b.page_title, "JavaScript required — Kitae",
+            "an unrenderable scripted shell keeps the honest interstitial"
+        );
+    }
+
+    #[cfg(feature = "page-js")]
+    #[test]
+    fn page_js_document_click_listener_mutates() {
+        let mut b = js_browser();
+        b.load_html(
+            "<html><body><div style=\"width:300px;height:200px\" id=\"area\"></div>\
+             <p id=\"x\">before</p><script>\
+             document.addEventListener('click', function () {\
+               document.getElementById('x').textContent = 'clicked words';\
+             });\
+             </script></body></html>",
+            "https://example.test/click",
+        );
+        assert!(page_text_of(&b).contains("before"));
+        b.click(50.0, 30.0); // inside the area rect; page-space
+        assert!(
+            page_text_of(&b).contains("clicked words"),
+            "document-level click listener mutated the page: {:?}",
+            page_text_of(&b)
+        );
+    }
+
+    #[cfg(feature = "page-js")]
+    #[test]
+    fn page_js_fetch_updates_the_page_on_poll() {
+        let server = loopback_html_server(vec![
+            (
+                "/page",
+                0,
+                "<html><body><p id=\"x\">static</p><script>\
+              document.write('FSUB');\
+              fetch('/api').then(function (r) { return r.text(); }).then(function (t) {\
+                document.write('FGOT:' + t);\
+                document.getElementById('x').textContent = t;\
+              });\
+              </script></body></html>",
+            ),
+            ("/api", 0, "fetched words"),
+        ]);
+        let mut b = js_browser();
+        b.navigate(&format!("{server}/page"));
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+            b.poll_page_js();
+            if page_text_of(&b).contains("fetched words") {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "fetch never settled into the DOM; body: {:?}; console: {:?}; trace: {:?} (flag: {})",
+                page_text_of(&b),
+                b.page_js.as_ref().map(|p| p.take_console()).unwrap_or_default(),
+                b.page_js.as_ref().map(|p| p.trace_snapshot()).unwrap_or_default(),
+                b.page_js_enabled
+            );
+        }
+    }
+
+    #[cfg(feature = "page-js")]
+    #[test]
+    fn page_js_inline_module_runs_in_strict_mode() {
+        let mut b = js_browser();
+        b.load_html(
+            "<html><body><p id=\"x\">static</p>\
+             <script type=\"module\">\
+             document.getElementById('x').textContent = this === undefined ? 'strict confirmed' : 'sloppy';\
+             </script></body></html>",
+            "https://example.test/mod",
+        );
+        assert!(
+            page_text_of(&b).contains("strict confirmed"),
+            "inline module evaluated: {:?}",
+            page_text_of(&b)
+        );
+    }
+
+    #[cfg(feature = "page-js")]
+    #[test]
+    fn page_js_module_static_imports_fetch_over_the_cache() {
+        let server = loopback_html_server(vec![
+            (
+                "/shell",
+                0,
+                "<html><body><p id=\"x\">static</p>\
+                 <script type=\"module\" src=\"/app.js\"></script></body></html>",
+            ),
+            (
+                "/app.js",
+                0,
+                "import { answer } from './dep.js';\
+                 document.getElementById('x').textContent = 'module said ' + answer;",
+            ),
+            ("/dep.js", 0, "export const answer = 42;"),
+        ]);
+        let mut b = js_browser();
+        b.navigate(&format!("{server}/shell"));
+        assert!(
+            page_text_of(&b).contains("module said 42"),
+            "external module chain resolved: {:?}",
+            page_text_of(&b)
+        );
+    }
+
+    #[cfg(feature = "page-js")]
+    #[test]
+    fn page_js_module_only_failure_keeps_the_interstitial() {
+        let server = loopback_html_server(vec![(
+            "/shell",
+            0,
+            "<html><body><div id=\"app\"></div>\
+             <script type=\"module\">import './nope-a.js';</script>\
+             <script type=\"module\">import './nope-b.js';</script></body></html>",
+        )]);
+        let mut b = js_browser();
+        b.navigate(&format!("{server}/shell"));
+        assert_eq!(
+            b.page_title, "JavaScript required — Kitae",
+            "a module-only shell that cannot import keeps the honest interstitial"
+        );
+    }
+
+    #[cfg(feature = "page-js")]
+    #[test]
+    fn page_js_style_property_writes_reach_the_layout() {
+        let mut b = js_browser();
+        b.load_html(
+            "<html><head><title>init</title></head><body><p id=\"x\">styled marker</p><script>\
+             var el = document.getElementById('x');\
+             el.style.color = 'red';\
+             el.style.setProperty('background-color', 'yellow');\
+             el.style.backgroundColor = 'blue';\
+             document.title = el.style.backgroundColor;\
+             el.style.removeProperty('background-color');\
+             </script></body></html>",
+            "https://example.test/style",
+        );
+        let page = b.page.as_ref().expect("page-js page mounted");
+        let node = page.dom.get_element_by_id("x").unwrap();
+        let style = page
+            .dom
+            .element(node)
+            .and_then(|e| e.attr("style"))
+            .unwrap_or_default()
+            .to_string();
+        assert!(
+            style.contains("color: red") && !style.contains("color: blue"),
+            "plain property writes land in the inline style: {style:?}"
+        );
+        assert!(
+            !style.contains("background-color"),
+            "removeProperty clears the declaration: {style:?}"
+        );
+        // The style object read camelCase state back into kebab-case:
+        // the getter's answer became the title.
+        assert_eq!(b.page_title, "blue", "camelCase getter round-tripped");
+        // The DOM mutation re-laid out with the new color.
+        b.poll_page_js();
+        assert!(
+            b.last_dl
+                .as_ref()
+                .map(|dl| dl.texts.iter().any(|t| t.color == 0xFF0000FF))
+                .unwrap_or(false),
+            "red text re-rendered after the style write"
+        );
+    }
+
+    #[cfg(feature = "page-js")]
+    #[test]
+    fn page_js_click_prevent_default_cancels_the_default_action() {
+        let opened = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let mut b = Browser::new(
+            Box::new(CaptureHost {
+                opened: opened.clone(),
+                messages: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
+            }),
+            Box::new(ApproxMeasurer),
+            (400.0, 600.0),
+        );
+        b.set_page_js(true);
+        b.load_html(
+            "<html><body><a href=\"mailto:hi@example.com\" id=\"a\">mail marker</a><script>\
+             document.getElementById('a').addEventListener('click', function (e) { e.preventDefault(); });\
+             </script></body></html>",
+            "https://example.test/pd",
+        );
+        assert!(page_text_of(&b).contains("mail marker"), "anchor rendered");
+        let link = b
+            .links()
+            .first()
+            .expect("the anchor became a link area")
+            .clone();
+        b.click(link.x + link.w / 2.0, link.y + link.h / 2.0);
+        assert!(
+            opened.lock().unwrap().is_empty(),
+            "preventDefault stood the mailto open down: {:?}",
+            opened.lock().unwrap()
+        );
+    }
+
+    #[cfg(feature = "page-js")]
+    #[test]
+    fn page_js_fired_listeners_no_longer_own_the_click() {
+        let opened = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let mut b = Browser::new(
+            Box::new(CaptureHost {
+                opened: opened.clone(),
+                messages: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
+            }),
+            Box::new(ApproxMeasurer),
+            (400.0, 600.0),
+        );
+        b.set_page_js(true);
+        b.load_html(
+            "<html><body><a href=\"mailto:x@example.com\" id=\"a\">delegated marker</a>\
+             <p id=\"m\">init</p><script>\
+             document.addEventListener('click', function () {\
+               document.getElementById('m').textContent = 'tracked';\
+             });\
+             </script></body></html>",
+            "https://example.test/deleg",
+        );
+        let link = b
+            .links()
+            .first()
+            .expect("the anchor became a link area")
+            .clone();
+        b.click(link.x + link.w / 2.0, link.y + link.h / 2.0);
+        assert!(
+            page_text_of(&b).contains("tracked"),
+            "the delegated listener ran: {:?}",
+            page_text_of(&b)
+        );
+        assert_eq!(
+            opened.lock().unwrap().as_slice(),
+            ["mailto:x@example.com"],
+            "the link still opened — a fired listener owns nothing"
+        );
+    }
+
+    #[cfg(feature = "page-js")]
+    #[test]
+    fn page_js_element_queries_scoping_closest_and_nth_child() {
+        let mut b = js_browser();
+        b.load_html(
+            "<html><body>\
+             <ul id=\"list\">\
+             <li>alpha</li><li class=\"pick\">beta</li><li>gamma</li>\
+             </ul>\
+             <section><em id=\"deep\">deep marker</em></section>\
+             <script>\
+             var picks = document.querySelectorAll('li:nth-child(-n+2)');\
+             if (picks.length !== 2) throw new Error('nth-child got ' + picks.length);\
+             var mid = document.querySelector('.pick');\
+             if (mid.closest('ul').id !== 'list') throw new Error('closest');\
+             var scope = document.getElementById('list');\
+             if (scope.querySelectorAll('li').length !== 3) throw new Error('scope count');\
+             if (scope.querySelectorAll('em').length !== 0) throw new Error('scope must not escape');\
+             document.getElementById('deep').textContent = 'counted ' + picks.length;\
+             </script></body></html>",
+            "https://example.test/q",
+        );
+        b.poll_page_js();
+        assert!(
+            page_text_of(&b).contains("counted 2"),
+            "the scripted assertions did not all pass: {:?}",
+            page_text_of(&b)
+        );
+    }
+
+    #[cfg(feature = "page-js")]
+    #[test]
+    fn page_js_animation_frames_channels_and_microtasks_run() {
+        let mut b = js_browser();
+        b.load_html(
+            "<html><body><p id=\"x\">static</p><script>             var out = [];             queueMicrotask(function () { out.push('micro'); });             requestAnimationFrame(function (ts) { out.push('raf' + (ts > 0)); });             var ch = new MessageChannel();             ch.port2.onmessage = function (e) { out.push('chan' + e.data); };             ch.port1.postMessage('42');             setInterval(function () { document.getElementById('x').textContent = out.join(' '); }, 10);             </script></body></html>",
+            "https://example.test/async",
+        );
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+            b.poll_page_js();
+            let text = page_text_of(&b);
+            if text.contains("micro") && text.contains("raf") && text.contains("chan42") {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "async primitives never ran: {text:?}"
+            );
+        }
+    }
+
+    #[cfg(feature = "page-js")]
+    #[test]
+    fn page_js_get_bounding_client_rect_answers_from_layout() {
+        let mut b = js_browser();
+        b.load_html(
+            "<html><body>             <div id=\"box\" style=\"width:300px;height:200px;background:#dddddd\"></div>             <p id=\"m\">init</p><script>             setTimeout(function () {               var r = document.getElementById('box').getBoundingClientRect();               document.getElementById('m').textContent =                 Math.round(r.width) + 'x' + Math.round(r.height) + ' v' + window.innerWidth;             }, 0);             </script></body></html>",
+            "https://example.test/geo",
+        );
+        b.poll_page_js();
+        assert!(
+            page_text_of(&b).contains("300x200 v400"),
+            "rect + viewport answers come from the rendered layout: {:?}",
+            page_text_of(&b)
+        );
+    }
+
+    #[cfg(feature = "page-js")]
+    #[test]
+    fn page_js_push_state_moves_the_url_without_reloading() {
+        let server = loopback_html_server(vec![(
+            "/base",
+            0,
+            "<html><body><p id=\"keep\">base marker</p><p id=\"x\">init</p><script>             history.pushState({ page: 1 }, '', '/route-a');             document.getElementById('x').textContent = 'state ' + (history.state && history.state.page) + ' moved';             </script></body></html>",
+        )]);
+        let mut b = js_browser();
+        b.navigate(&format!("{server}/base"));
+        b.poll_page_js();
+        assert!(
+            b.page_url.ends_with("/route-a"),
+            "the address bar followed the state move: {}",
+            b.page_url
+        );
+        let text = page_text_of(&b);
+        assert!(
+            text.contains("state 1 moved") && text.contains("base marker"),
+            "the document survived (no reload): {text:?}"
+        );
+    }
+
+    #[cfg(feature = "page-js")]
+    #[test]
+    fn page_js_back_fires_popstate_on_the_loaded_document() {
+        let server = loopback_html_server(vec![
+            (
+                "/a",
+                0,
+                "<html><body><p id=\"x\">a marker</p><script>                 document.addEventListener('popstate', function () {                   document.getElementById('x').textContent = 'popstate seen';                 });                 </script></body></html>",
+            ),
+            ("/b", 0, "<html><body><p>b marker</p></body></html>"),
+        ]);
+        let mut b = js_browser();
+        b.navigate(&format!("{server}/a"));
+        b.navigate(&format!("{server}/b"));
+        b.go(-1);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+            let _ = b.poll_fetches();
+            b.poll_page_js();
+            if page_text_of(&b).contains("popstate seen") {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "popstate never fired; url {:?}, body {:?}",
+                b.page_url,
+                page_text_of(&b)
+            );
+        }
+    }
+
+    #[cfg(feature = "page-js")]
+    #[test]
+    fn page_js_click_bubbles_with_capture_and_stop_propagation() {
+        let mut b = js_browser();
+        b.load_html(
+            "<html><body>             <div id=\"outer\" style=\"width:300px;height:200px;background:#eeeeee\">             <div id=\"inner\" style=\"width:100px;height:100px;background:#cccccc\"></div></div>             <p id=\"m\">init</p><script>             var log = [];             var stop = false;             document.getElementById('outer').addEventListener('click', function () { log.push('cap'); }, true);             document.getElementById('inner').addEventListener('click', function (e) {               log.push('in'); if (stop) e.stopPropagation();             });             document.getElementById('outer').addEventListener('click', function () { log.push('bub'); });             document.addEventListener('click', function () { log.push('doc'); });             window.__kitaeLog = log;             window.__kitaeStop = function () { stop = true; };             </script></body></html>",
+            "https://example.test/bubble",
+        );
+        // First click: full capture → target → bubble → document chain.
+        // The point must be inside #inner's box (body margin shifts it to
+        // x 150..250).
+        b.click(200.0, 60.0);
+        let read = |b: &mut Browser| -> String {
+            b.page_js
+                .as_mut()
+                .map(|p| {
+                    p.host_eval_for_test("JSON.stringify(window.__kitaeLog)")
+                        .unwrap_or_default()
+                })
+                .unwrap_or_default()
+        };
+        assert_eq!(
+            read(&mut b),
+            "[\"cap\",\"in\",\"bub\",\"doc\"]",
+            "capture/target/bubble order"
+        );
+        // Second click with stopPropagation at the target: no bubble, no doc.
+        b.page_js
+            .as_mut()
+            .map(|p| p.host_eval_for_test("window.__kitaeStop()"));
+        b.click(200.0, 60.0);
+        assert_eq!(
+            read(&mut b),
+            "[\"cap\",\"in\",\"bub\",\"doc\",\"cap\",\"in\"]",
+            "stopPropagation honored"
+        );
+    }
+
+    #[cfg(feature = "page-js")]
+    #[test]
+    fn page_js_typing_dispatches_input_and_key_events() {
+        let mut b = js_browser();
+        b.load_html(
+            "<html><body>             <input id=\"t\" type=\"text\" style=\"width:200px;height:24px\">             <p id=\"m\">init</p><script>             var keys = 0;             var t = document.getElementById('t');             t.addEventListener('keydown', function () { keys++; });             t.addEventListener('input', function (e) {               document.getElementById('m').textContent = 'input:' + e.data + ':keys' + keys;             });             </script></body></html>",
+            "https://example.test/typing",
+        );
+        let input_node = b
+            .page
+            .as_ref()
+            .and_then(|p| p.dom.get_element_by_id("t"))
+            .expect("input node");
+        // Focus by click (engine form-control path), then type through the
+        // engine's own caret insertion.
+        b.click(20.0, 30.0);
+        assert_eq!(b.focused, Some(input_node), "typing needs the caret");
+        assert!(b.type_into_focused("hi"), "engine inserted");
+        assert!(
+            page_text_of(&b).contains("input:hi:keys1"),
+            "input event carried the data; keydown fired first: {:?}",
+            page_text_of(&b)
+        );
+    }
+
+    #[cfg(feature = "page-js")]
+    #[test]
+    fn page_js_change_fires_for_discrete_controls() {
+        let mut b = js_browser();
+        b.load_html(
+            "<html><body>             <input id=\"c\" type=\"checkbox\" style=\"width:20px;height:20px\">             <select id=\"s\" style=\"width:120px;height:24px\">             <option value=\"a\" selected>alpha</option><option value=\"b\">beta</option></select>             <script>             var log = [];             document.getElementById('c').addEventListener('change', function (e) {               log.push('c:' + (e.target.checked ? 'on' : 'off'));             });             document.getElementById('s').addEventListener('change', function (e) {               log.push('s:' + e.target.value);             });             window.__kitaeLog = log;             </script></body></html>",
+            "https://example.test/change",
+        );
+        let cb = b
+            .page
+            .as_ref()
+            .and_then(|p| p.dom.get_element_by_id("c"))
+            .expect("checkbox node");
+        let spot = b
+            .last_dl
+            .as_ref()
+            .and_then(|dl| dl.rects.iter().find(|r| r.node == cb.0))
+            .map(|r| (r.x + r.w / 2.0, r.y + r.h / 2.0))
+            .expect("checkbox painted a box");
+        b.click(spot.0, spot.1);
+        let read = |b: &mut Browser| -> String {
+            b.page_js
+                .as_mut()
+                .map(|p| {
+                    p.host_eval_for_test("JSON.stringify(window.__kitaeLog)")
+                        .unwrap_or_default()
+                })
+                .unwrap_or_default()
+        };
+        assert_eq!(
+            read(&mut b),
+            "[\"c:on\"]",
+            "a toggle commits: change carries the new checked state"
+        );
+        // The host dropdown reports through set_input_value — same commit.
+        assert!(b.set_input_value("s", "b"), "option b exists");
+        assert_eq!(
+            read(&mut b),
+            "[\"c:on\",\"s:b\"]",
+            "select.value follows the choice"
+        );
+    }
+
+    #[cfg(feature = "page-js")]
+    #[test]
+    fn page_js_construct_events_with_options() {
+        let mut b = js_browser();
+        b.load_html(
+            "<html><body>             <div id=\"outer\"><div id=\"inner\"></div></div>             <p id=\"m\">init</p><script>             var log = [];             var outer = document.getElementById('outer');             var inner = document.getElementById('inner');             outer.addEventListener('ping', function (e) { log.push('o:' + e.detail); });             inner.addEventListener('ping', function (e) { log.push('i:' + e.detail + ':' + (e.target === inner)); });             var hits = 0;             inner.addEventListener('tick', function () { hits += 1; }, { once: true });             var ctl = new AbortController();             inner.addEventListener('tick', function () { hits += 100; }, { signal: ctl.signal });             inner.addEventListener('block', function (e) { e.preventDefault(); }, { once: true });             var nonCancel = new Event('quiet', { bubbles: true });             inner.addEventListener('quiet', function (e) { e.preventDefault(); }, { once: true });             var r1 = inner.dispatchEvent(new CustomEvent('ping', { detail: 7, bubbles: true }));             inner.dispatchEvent(new CustomEvent('tick'));             ctl.abort();             inner.dispatchEvent(new CustomEvent('tick'));             var r2 = inner.dispatchEvent(new CustomEvent('block', { cancelable: true }));             inner.dispatchEvent(nonCancel);             var kb = new KeyboardEvent('keydown', { key: 'Enter' }).key;             var cap = 0;             outer.addEventListener('plain', function () { cap++; }, true);             var bub = 0;             outer.addEventListener('plain', function () { bub++; });             inner.dispatchEvent(new Event('plain', { bubbles: false }));             window.__r = [log.join('|'), r1, r2, hits, nonCancel.defaultPrevented, kb, cap, bub].join(' ');             </script></body></html>",
+            "https://example.test/events",
+        );
+        let read = b
+            .page_js
+            .as_mut()
+            .and_then(|p| p.host_eval_for_test("window.__r"))
+            .unwrap_or_default();
+        assert_eq!(
+            read, "i:7:true|o:7 true false 101 false Enter 1 0",
+            "constructors + propagation + once/signal/cancel semantics"
+        );
+    }
+
+    #[cfg(feature = "page-js")]
+    #[test]
+    fn page_js_url_search_params_and_clone() {
+        let mut b = js_browser();
+        b.load_html(
+            "<html><body>             <p id=\"m\">init</p><script>             var u = new URL('/search?q=ada&q=lace#frag', location.href);             var sp = u.searchParams;             sp.set('q', 'one');             sp.append('extra', '2 words');             var list = sp.getAll('q').join(',');             var round = sp.toString();             var cyc = { a: 1 };             cyc.self = cyc;             var c = structuredClone(cyc);             var thrown = '';             try { structuredClone(function () {}); } catch (e) { thrown = e.name; }             var copy = structuredClone({ list: [1, 2, { deep: true }] });             window.__r = [u.pathname, u.host, u.hash, u.search, list, round, c.self === c, c.a, copy.list[2].deep, thrown].join(' ');             </script></body></html>",
+            "https://example.test/urls",
+        );
+        let read = b
+            .page_js
+            .as_mut()
+            .and_then(|p| p.host_eval_for_test("window.__r"))
+            .unwrap_or_default();
+        assert_eq!(
+            read, "/search example.test #frag ?q=one&extra=2+words one q=one&extra=2+words true 1 true DataCloneError",
+            "URL components, live searchParams linkage, structuredClone"
+        );
+    }
+
+    #[cfg(feature = "page-js")]
+    #[test]
+    fn page_js_dataset_reads_and_writes() {
+        let mut b = js_browser();
+        b.load_html(
+            "<html><body>             <div id=\"d\" data-user-id=\"42\" data-flag></div>             <p id=\"m\">init</p><script>             var d = document.getElementById('d');             var a = d.dataset.userId;             d.dataset.role = 'admin';             var b2 = d.getAttribute('data-role');             delete d.dataset.flag;             var c = d.hasAttribute('data-flag');             var keys = Object.keys(d.dataset).join(',');             window.__r = a + ' ' + b2 + ' ' + c + ' ' + keys;             </script></body></html>",
+            "https://example.test/data",
+        );
+        let read = b
+            .page_js
+            .as_mut()
+            .and_then(|p| p.host_eval_for_test("window.__r"))
+            .unwrap_or_default();
+        assert_eq!(
+            read, "42 admin false userId,role",
+            "dataset camelCase mapping + deletion + enumeration"
+        );
+    }
+
+    #[cfg(feature = "page-js")]
+    #[test]
+    fn page_js_computed_style_reads() {
+        let mut b = js_browser();
+        b.load_html(
+            "<html><body>             <div id=\"box\" style=\"width:50%;height:80px;color:#ff0000;background:#eeeeee\"></div>             <script>             setTimeout(function () {               var box = document.getElementById('box');               var cs = getComputedStyle(box);               var r = box.getBoundingClientRect();               window.__r = [                 cs.getPropertyValue('color'),                 cs.getPropertyValue('width'),                 cs.width === Math.round(r.width * 100) / 100 + 'px',                 cs.getPropertyValue('height'),                 '[' + cs.getPropertyValue('nonexistent') + ']'               ].join('|');             }, 0);             </script></body></html>",
+            "https://example.test/style",
+        );
+        b.poll_page_js();
+        let read = b
+            .page_js
+            .as_mut()
+            .and_then(|p| p.host_eval_for_test("window.__r"))
+            .unwrap_or_default();
+        assert!(
+            read.starts_with("rgb(255, 0, 0)|"),
+            "computed color: {read:?}"
+        );
+        assert!(
+            read.contains("|true|"),
+            "used width answered in painted px: {read:?}"
+        );
+        assert!(read.contains("80px"), "computed height: {read:?}");
+        assert!(
+            read.ends_with("|[]"),
+            "unknown property reads empty: {read:?}"
+        );
+    }
+
+    #[cfg(feature = "page-js")]
+    #[test]
+    fn page_js_scroll_focus_and_selection_apis() {
+        let mut b = js_browser();
+        b.load_html(
+            "<html><body>             <div style=\"height:1200px;background:#eeeeee\"></div>             <input id=\"t\" type=\"text\" value=\"hello\" style=\"width:120px;height:24px\">             <script>             window.__t = document.getElementById('t');             window.__h = document.documentElement;             window.scrollTo(0, 250);             window.__t.focus();             </script></body></html>",
+            "https://example.test/scroll",
+        );
+        b.poll_page_js();
+        let input_node = b
+            .page
+            .as_ref()
+            .and_then(|p| p.dom.get_element_by_id("t"))
+            .expect("input node");
+        assert!((b.scroll_y() - 250.0).abs() < 0.5, "scrollTo applied");
+        assert_eq!(b.focused, Some(input_node), "focus() applied");
+        assert_eq!(b.select_all(), "hello", "engine selection");
+        // Read through the page's own wrappers: `host_eval_for_test` runs
+        // outside the DOM scope, so the expression touches only JS state
+        // (the wrappers were minted during the script phase and are cached).
+        let read = b
+            .page_js
+            .as_mut()
+            .and_then(|p| {
+                p.host_eval_for_test(
+                    "window.scrollY + ' ' + (document.activeElement === window.__t) + ' ' + window.__h.scrollTop + ' ' + window.getSelection().toString()",
+                )
+            })
+            .unwrap_or_default();
+        assert_eq!(
+            read, "250 true 250 hello",
+            "the view state reads back through the JS surface"
+        );
+    }
+
+    #[cfg(feature = "page-js")]
+    #[test]
+    fn page_js_mutation_observer_records_attributes_and_children() {
+        let mut b = js_browser();
+        b.load_html(
+            "<html><body><p>seed</p>\
+             <div id=\"host\"></div>\
+             <script>\
+             window.__log = [];\
+             var host = document.getElementById('host');\
+             host.setAttribute('a', '1');\
+             var mo = new MutationObserver(function (recs) {\
+               for (var i = 0; i < recs.length; i++) {\
+                 var r = recs[i];\
+                 window.__log.push(r.type + ':' + (r.attributeName === null ? '-' : r.attributeName) + ':' + (r.oldValue === null ? '-' : r.oldValue) + ':' + r.addedNodes.length + ':' + r.removedNodes.length + ':' + r.target.tagName);\
+               }\
+             });\
+             mo.observe(host, { childList: true, attributes: true, attributeOldValue: true, subtree: true });\
+             host.setAttribute('a', '2');\
+             var span = document.createElement('span');\
+             host.appendChild(span);\
+             span.textContent = 'x';\
+             host.removeAttribute('a');\
+             </script></body></html>",
+            "https://example.test/mut",
+        );
+        let read = |b: &mut Browser| -> String {
+            b.page_js
+                .as_mut()
+                .and_then(|p| p.host_eval_for_test("window.__log.join('|')"))
+                .unwrap_or_default()
+        };
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while !read(&mut b).contains("attributes:a:2") {
+            b.poll_page_js();
+            std::thread::sleep(std::time::Duration::from_millis(3));
+            assert!(
+                std::time::Instant::now() < deadline,
+                "records: {:?}",
+                read(&mut b)
+            );
+        }
+        assert_eq!(
+            read(&mut b),
+            "attributes:a:1:0:0:DIV|childList:-:-:1:0:DIV|childList:-:-:1:0:SPAN|attributes:a:2:0:0:DIV",
+            "journaled records arrive in mutation order with old values and subtree coverage"
+        );
+    }
+
+    #[cfg(feature = "page-js")]
+    #[test]
+    fn page_js_mutation_observer_take_records_and_disconnect() {
+        let mut b = js_browser();
+        b.load_html(
+            "<html><body><p>seed</p>\
+             <div id=\"host\"></div>\
+             <script>\
+             window.__calls = 0;\
+             var host = document.getElementById('host');\
+             var mo = new MutationObserver(function () { window.__calls++; });\
+             mo.observe(host, { attributes: true });\
+             host.setAttribute('a', '1');\
+             window.__taken = mo.takeRecords().length;\
+             host.setAttribute('b', '2');\
+             mo.disconnect();\
+             host.setAttribute('c', '3');\
+             window.__r = window.__taken + ':' + window.__calls;\
+             </script></body></html>",
+            "https://example.test/mut2",
+        );
+        for _ in 0..8 {
+            b.poll_page_js();
+            std::thread::sleep(std::time::Duration::from_millis(3));
+        }
+        let read = b
+            .page_js
+            .as_mut()
+            .and_then(|p| p.host_eval_for_test("window.__r"))
+            .unwrap_or_default();
+        assert_eq!(
+            read, "1:0",
+            "takeRecords drains synchronously; disconnect silences the observer"
+        );
+    }
+
+    #[cfg(feature = "page-js")]
+    #[test]
+    fn page_js_intersection_observer_tracks_scrolling() {
+        let mut b = js_browser();
+        b.load_html(
+            "<html><body style=\"margin:0\">\
+             <div style=\"height:2000px\"></div>\
+             <div id=\"t\" style=\"height:100px;background:#dddddd\"></div>\
+             <script>\
+             window.__seq = [];\
+             var t = document.getElementById('t');\
+             var io = new IntersectionObserver(function (es) {\
+               for (var i = 0; i < es.length; i++) window.__seq.push(es[i].isIntersecting ? 'in' : 'out');\
+             });\
+             io.observe(t);\
+             setTimeout(function () { window.__seq.push('scrolling'); window.scrollTo(0, 1700); }, 30);\
+             setTimeout(function () { window.__r = window.__seq.join('|'); }, 90);\
+             </script></body></html>",
+            "https://example.test/io",
+        );
+        let read = |b: &mut Browser| -> String {
+            b.page_js
+                .as_mut()
+                .and_then(|p| p.host_eval_for_test("window.__r || ''"))
+                .unwrap_or_default()
+        };
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while !read(&mut b).contains("scrolling") {
+            b.poll_page_js();
+            std::thread::sleep(std::time::Duration::from_millis(3));
+            assert!(
+                std::time::Instant::now() < deadline,
+                "seq: {:?}",
+                read(&mut b)
+            );
+        }
+        let seq = read(&mut b);
+        assert!(
+            seq.starts_with("out|scrolling|in"),
+            "below the fold first, intersecting after the script's scroll: {seq:?}"
+        );
+    }
+
+    #[cfg(feature = "page-js")]
+    #[test]
+    fn page_js_resize_observer_reports_size_changes() {
+        let mut b = js_browser();
+        b.load_html(
+            "<html><body style=\"margin:0\">\
+             <div id=\"t\" style=\"width:200px;height:100px;background:#dddddd\"></div>\
+             <script>\
+             window.__seq = [];\
+             var t = document.getElementById('t');\
+             var ro = new ResizeObserver(function (es) {\
+               for (var i = 0; i < es.length; i++) window.__seq.push(Math.round(es[i].contentRect.width) + 'x' + Math.round(es[i].contentRect.height));\
+             });\
+             ro.observe(t);\
+             setTimeout(function () { t.style.width = '400px'; }, 30);\
+             setTimeout(function () { window.__r = window.__seq.join('|'); }, 90);\
+             </script></body></html>",
+            "https://example.test/ro",
+        );
+        let read = |b: &mut Browser| -> String {
+            b.page_js
+                .as_mut()
+                .and_then(|p| p.host_eval_for_test("window.__r || ''"))
+                .unwrap_or_default()
+        };
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while !read(&mut b).contains('|') {
+            b.poll_page_js();
+            std::thread::sleep(std::time::Duration::from_millis(3));
+            assert!(
+                std::time::Instant::now() < deadline,
+                "seq: {:?}",
+                read(&mut b)
+            );
+        }
+        let seq = read(&mut b);
+        let last_w: f32 = seq
+            .rsplit('|')
+            .next()
+            .and_then(|box_| box_.split('x').next())
+            .and_then(|w| w.parse().ok())
+            .unwrap_or(0.0);
+        assert!(
+            seq.starts_with("200x100") && last_w > 300.0,
+            "initial size then the scripted resize (width grew): {seq:?}"
+        );
+    }
+
+    #[cfg(feature = "page-js")]
+    #[test]
+    fn page_js_xhr_reads_a_response_through_the_pool() {
+        let (server, _seen) = loopback_echo_server(vec![(
+            "/page",
+            "<html><body><p>xhr</p><script>\
+             var xhr = new XMLHttpRequest();\
+             window.__seq = [];\
+             xhr.onreadystatechange = function () { window.__seq.push(xhr.readyState); };\
+             xhr.open('GET', '/data');\
+             xhr.setRequestHeader('X-Probe', '1');\
+             xhr.onload = function () {\
+               window.__r = xhr.status + '|' + xhr.responseText + '|' + xhr.getResponseHeader('content-type') + '|' + (xhr.getAllResponseHeaders().indexOf('content-length: ') >= 0);\
+             };\
+             xhr.onerror = function () { window.__r = 'error'; };\
+             xhr.send();\
+             </script></body></html>",
+        )]);
+        let mut b = js_browser();
+        b.navigate(&format!("{server}/page"));
+        let read = |b: &mut Browser| -> String {
+            b.page_js
+                .as_mut()
+                .and_then(|p| p.host_eval_for_test("'' + (window.__r || '')"))
+                .unwrap_or_default()
+        };
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while read(&mut b).is_empty() {
+            std::thread::sleep(std::time::Duration::from_millis(5));
+            b.poll_page_js();
+            assert!(
+                std::time::Instant::now() < deadline,
+                "xhr never settled; r {:?} trace {:?}",
+                read(&mut b),
+                b.page_js
+                    .as_ref()
+                    .map(|p| p.trace_snapshot().join(" / "))
+                    .unwrap_or_default()
+            );
+        }
+        let text = read(&mut b);
+        assert!(
+            text.starts_with("200|[GET] "),
+            "status and echoed body arrived: {text:?}"
+        );
+        assert!(
+            text.contains("text/plain") && text.ends_with("true"),
+            "response headers readable: {text:?}"
+        );
+        let seq = b
+            .page_js
+            .as_mut()
+            .and_then(|p| p.host_eval_for_test("window.__seq.join(',')"))
+            .unwrap_or_default();
+        assert!(
+            seq.starts_with("1,") && seq.ends_with(",4"),
+            "readyState ladder reports OPENED then DONE: {seq:?}"
+        );
+    }
+
+    #[cfg(feature = "page-js")]
+    #[test]
+    fn page_js_worker_round_trips_messages() {
+        let (server, _seen) = loopback_echo_server(vec![
+            (
+                "/page",
+                "<html><body><p>worker</p><script>\
+                 window.__msgs = [];\
+                 var w = new Worker('/worker.js');\
+                 w.onmessage = function (e) {\
+                   window.__msgs.push('echo:' + e.data.n);\
+                   if (window.__msgs.length === 2) { window.__r = window.__msgs.join(','); w.terminate(); }\
+                 };\
+                 w.onerror = function (e) { window.__r = 'worker-error:' + e.message; };\
+                 w.postMessage({ n: 41 });\
+                 </script></body></html>",
+            ),
+            (
+                "/worker.js",
+                "self.postMessage({ n: 1 });\
+                 self.onmessage = function (e) { self.postMessage({ n: e.data.n + 1 }); };",
+            ),
+        ]);
+        let mut b = js_browser();
+        b.navigate(&format!("{server}/page"));
+        let read = |b: &mut Browser| -> String {
+            b.page_js
+                .as_mut()
+                .and_then(|p| p.host_eval_for_test("window.__r || ''"))
+                .unwrap_or_default()
+        };
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while read(&mut b).is_empty() {
+            std::thread::sleep(std::time::Duration::from_millis(5));
+            b.poll_page_js();
+            assert!(
+                std::time::Instant::now() < deadline,
+                "worker never answered"
+            );
+        }
+        assert_eq!(
+            read(&mut b),
+            "echo:1,echo:42",
+            "worker init message then the round trip"
+        );
+    }
+
+    #[cfg(feature = "page-js")]
+    #[test]
+    fn page_js_storage_is_origin_scoped_and_ordered() {
+        pagejs::reset_web_storage();
+        let (server, _seen) = loopback_echo_server(vec![
+            (
+                "/one",
+                "<html><body><p>storage one</p><script>\
+                 localStorage.setItem('alpha', 'first');\
+                 localStorage.setItem('beta', 'second');\
+                 localStorage.beta = 'third';\
+                 window.__one = [\
+                   localStorage.getItem('alpha'),\
+                   localStorage.length,\
+                   localStorage.key(0),\
+                   localStorage.key(1),\
+                   localStorage.beta,\
+                   ('beta' in localStorage),\
+                   Object.keys(localStorage).join(','),\
+                 ].join('|');\
+                 </script></body></html>",
+            ),
+            (
+                "/two",
+                "<html><body><p>storage two</p><script>\
+                 window.__two = localStorage.getItem('beta') + '|' + localStorage.length;\
+                 localStorage.removeItem('alpha');\
+                 localStorage.setItem('alpha', 'readded');\
+                 window.__order = localStorage.key(0) + ',' + localStorage.key(1);\
+                 delete localStorage.alpha;\
+                 window.__after = localStorage.getItem('alpha') + '|' + localStorage.length + '|' + ('alpha' in localStorage);\
+                 </script></body></html>",
+            ),
+        ]);
+        let mut b = js_browser();
+        b.navigate(&format!("{server}/one"));
+        let one = read_js(&mut b, "window.__one");
+        assert_eq!(
+            one, "first|2|alpha|beta|third|true|alpha,beta",
+            "writes, the named-property read and key order on the first page"
+        );
+        // A second browser at the same origin sees the same localStorage:
+        // the area is per origin, not per page.
+        let mut c = js_browser();
+        c.navigate(&format!("{server}/two"));
+        assert_eq!(
+            read_js(&mut c, "window.__two"),
+            "third|2",
+            "same-origin localStorage is shared across browsers"
+        );
+        assert_eq!(
+            read_js(&mut c, "window.__order"),
+            "beta,alpha",
+            "removeItem + setItem moves the key to the end (spec order)"
+        );
+        assert_eq!(
+            read_js(&mut c, "window.__after"),
+            "null|1|false",
+            "delete removes the named property and shortens the area"
+        );
+    }
+
+    #[cfg(feature = "page-js")]
+    #[test]
+    fn page_js_session_storage_is_private_to_one_browser() {
+        pagejs::reset_web_storage();
+        let (server, _seen) = loopback_echo_server(vec![
+            (
+                "/write",
+                "<html><body><p>session one</p><script>\
+                 sessionStorage.setItem('token', 'abc');\
+                 window.__r = sessionStorage.getItem('token') + '|' + sessionStorage.length;\
+                 </script></body></html>",
+            ),
+            (
+                "/read",
+                "<html><body><p>session two</p><script>\
+                 window.__r = sessionStorage.getItem('token') + '|' + sessionStorage.length;\
+                 </script></body></html>",
+            ),
+        ]);
+        let mut b = js_browser();
+        b.navigate(&format!("{server}/write"));
+        assert_eq!(read_js(&mut b, "window.__r"), "abc|1", "session write");
+        // Same browser, same origin, new document: the session area
+        // survives navigation inside the tab.
+        b.navigate(&format!("{server}/read"));
+        assert_eq!(
+            read_js(&mut b, "window.__r"),
+            "abc|1",
+            "sessionStorage survives same-tab navigation"
+        );
+        // A different browser is a different session: its area is empty.
+        let mut c = js_browser();
+        c.navigate(&format!("{server}/read"));
+        assert_eq!(
+            read_js(&mut c, "window.__r"),
+            "null|0",
+            "sessionStorage is private to its browser"
+        );
+    }
+
+    #[cfg(feature = "page-js")]
+    #[test]
+    fn page_js_storage_refuses_an_opaque_origin() {
+        pagejs::reset_web_storage();
+        let mut b = js_browser();
+        // file: URLs have an opaque origin; every operation must refuse.
+        b.load_html(
+            "<html><body><p>opaque</p><script>\
+             var out = [];\
+             try { localStorage.getItem('x'); out.push('get'); } catch (e) { out.push(e.name); }\
+             try { localStorage.setItem('x', '1'); out.push('set'); } catch (e) { out.push(e.name); }\
+             try { localStorage.length; out.push('length'); } catch (e) { out.push(e.name); }\
+             window.__r = out.join(',');\
+             </script></body></html>",
+            "file:///tmp/kitae-storage.html",
+        );
+        assert_eq!(
+            read_js(&mut b, "window.__r"),
+            "SecurityError,SecurityError,SecurityError",
+            "opaque origins cannot touch Web Storage"
+        );
+    }
+
+    #[cfg(feature = "page-js")]
+    #[test]
+    fn web_raster_decodes_a_png_data_url() {
+        // The raster store is process-global: hold the test lock and clear
+        // it so parallel decode tests can't leak entries into these
+        // assertions (and vice versa).
+        let _store = crate::qtsq_test_lock();
+        clear_qtsq_rasters();
+        let img = kitae_media::RgbaImage {
+            width: 2,
+            height: 1,
+            pixels: vec![255, 0, 0, 255, 0, 0, 255, 255],
+        };
+        let png = kitae_media::encode_png(&img).expect("encode");
+        let url = format!("data:image/png;base64,{}", b64_encode(&png));
+        let raster = ensure_web_raster(&url).expect("a PNG data URL decodes");
+        assert_eq!((raster.width, raster.height), (2, 1));
+        assert_eq!(&raster.pixels[0..4], &[255, 0, 0, 255]);
+    }
+
+    #[cfg(feature = "page-js")]
+    #[test]
+    fn page_js_canvas_paints_shapes_into_the_raster_cache() {
+        // The raster store is process-global: hold the test lock and clear
+        // it so parallel decode tests can't leak entries into these
+        // assertions (and vice versa).
+        let _store = crate::qtsq_test_lock();
+        clear_qtsq_rasters();
+        let mut b = js_browser();
+        b.load_html(
+            "<html><body><p>canvas</p>\
+             <canvas id=\"c\" width=\"120\" height=\"60\"></canvas>\
+             <script>\
+             var c = document.getElementById('c');\
+             var g = c.getContext('2d');\
+             g.fillStyle = '#ff0000';\
+             g.fillRect(0, 0, 10, 10);\
+             g.fillStyle = 'rgb(0, 128, 255)';\
+             g.fillRect(20, 10, 5, 5);\
+             window.__r = g.canvas.width + 'x' + g.canvas.height + '|' + c.width + 'x' + c.height;\
+             </script></body></html>",
+            "https://canvas.test/page",
+        );
+        b.poll_page_js();
+        assert_eq!(
+            read_js(&mut b, "window.__r"),
+            "120x60|120x60",
+            "the context reports the canvas element's IDL size"
+        );
+        let dl = b.last_dl.as_ref().expect("published frame");
+        let im = dl
+            .images
+            .iter()
+            .find(|im| im.src.starts_with("\u{0}canvas:"))
+            .expect("the canvas is a display-list image");
+        assert_eq!((im.w, im.h), (120.0, 60.0), "the box is the attribute size");
+        let payload = im.payload.expect("the flushed buffer registered a raster");
+        let raster = qtsq_raster_for_id(payload).expect("registered pixels");
+        assert_eq!((raster.width, raster.height), (120, 60));
+        let px = |x: usize, y: usize| {
+            let i = (y * 120 + x) * 4;
+            [
+                raster.pixels[i],
+                raster.pixels[i + 1],
+                raster.pixels[i + 2],
+                raster.pixels[i + 3],
+            ]
+        };
+        assert_eq!(px(1, 1), [255, 0, 0, 255], "a hex fillRect landed");
+        assert_eq!(px(22, 12), [0, 128, 255, 255], "an rgb() fillRect landed");
+        assert_eq!(
+            px(50, 30),
+            [0, 0, 0, 0],
+            "untouched pixels stay transparent"
+        );
+    }
+
+    #[cfg(feature = "page-js")]
+    #[test]
+    fn page_js_canvas_image_data_and_png_round_trip() {
+        // The raster store is process-global: hold the test lock and clear
+        // it so parallel decode tests can't leak entries into these
+        // assertions (and vice versa).
+        let _store = crate::qtsq_test_lock();
+        clear_qtsq_rasters();
+        let mut b = js_browser();
+        b.load_html(
+            "<html><body><p>canvas data</p>\
+             <canvas id=\"c\" width=\"8\" height=\"4\"></canvas>\
+             <script>\
+             var c = document.getElementById('c');\
+             var g = c.getContext('2d');\
+             g.fillStyle = 'blue';\
+             g.fillRect(0, 0, 4, 2);\
+             var img = g.getImageData(0, 0, 4, 2);\
+             window.__read = [img.data[0], img.data[1], img.data[2], img.data[3]].join(',') + '|' + img.width + 'x' + img.height;\
+             g.putImageData(img, 4, 2);\
+             var back = g.getImageData(4, 2, 1, 1).data;\
+             window.__put = [back[0], back[1], back[2], back[3]].join(',');\
+             window.__url = c.toDataURL();\
+             </script></body></html>",
+            "https://canvas.test/data",
+        );
+        b.poll_page_js();
+        assert_eq!(
+            read_js(&mut b, "window.__read"),
+            "0,0,255,255|4x2",
+            "getImageData reads the drawn pixels"
+        );
+        assert_eq!(
+            read_js(&mut b, "window.__put"),
+            "0,0,255,255",
+            "putImageData writes them back"
+        );
+        // The data URL is a PNG the engine's own decoder accepts.
+        let url = read_js(&mut b, "window.__url");
+        let b64 = url
+            .strip_prefix("data:image/png;base64,")
+            .unwrap_or_else(|| panic!("canvas PNG data URL: {url:?}"));
+        let png = b64_decode(b64).expect("base64 payload");
+        let decoded = kitae_media::decode_png(&png).expect("engine decodes its own canvas PNG");
+        assert_eq!((decoded.width, decoded.height), (8, 4));
+        assert_eq!(
+            &decoded.pixels[0..4],
+            &[0, 0, 255, 255],
+            "the round-tripped pixel is the drawn blue"
+        );
+    }
+
+    #[cfg(feature = "page-js")]
+    #[test]
+    fn page_js_canvas_draws_images_and_honours_transforms() {
+        // The raster store is process-global: hold the test lock and clear
+        // it so parallel decode tests can't leak entries into these
+        // assertions (and vice versa).
+        let _store = crate::qtsq_test_lock();
+        clear_qtsq_rasters();
+        // A 2x2 PNG: red, green / blue, white.
+        let img = kitae_media::RgbaImage {
+            width: 2,
+            height: 2,
+            pixels: vec![
+                255, 0, 0, 255, 0, 255, 0, 255, 0, 0, 255, 255, 255, 255, 255, 255,
+            ],
+        };
+        let png = kitae_media::encode_png(&img).expect("encode");
+        let src = format!("data:image/png;base64,{}", b64_encode(&png));
+        let mut b = js_browser();
+        b.load_html(
+            &format!(
+                "<html><body><p>canvas draw</p>\
+                 <img id=\"i\" src=\"{src}\">\
+                 <canvas id=\"c\" width=\"20\" height=\"20\"></canvas>\
+                 <script>\
+                 var c = document.getElementById('c');\
+                 var g = c.getContext('2d');\
+                 g.drawImage(document.getElementById('i'), 2, 2, 4, 4);\
+                 g.translate(10, 10);\
+                 g.fillStyle = '#00ff00';\
+                 g.fillRect(0, 0, 2, 2);\
+                 var d = g.getImageData(3, 3, 1, 1).data;\
+                 var t = g.getImageData(11, 11, 1, 1).data;\
+                 window.__r = [d[0], d[1], d[2], d[3]].join(',') + '|' + [t[0], t[1], t[2], t[3]].join(',');\
+                 </script></body></html>"
+            ),
+            "https://canvas.test/draw",
+        );
+        b.poll_page_js();
+        assert_eq!(
+            read_js(&mut b, "window.__r"),
+            "255,0,0,255|0,255,0,255",
+            "drawImage scaled the PNG (top-left source pixel) and translate moved the fill"
+        );
+    }
+
+    #[cfg(feature = "page-js")]
+    #[test]
+    fn page_js_fetch_post_carries_formdata_over_the_pool() {
+        let (server, seen) = loopback_echo_server(vec![(
+            "/page",
+            "<html><body><p id=\"m\">init</p><script>             var fd = new FormData();             fd.append('name', 'ada');             fd.append('note', 'two words');             fetch('/submit', { method: 'POST', body: fd })               .then(function (r) {                 var head = r.headers.get('content-type') + '|' + r.status;                 return r.text().then(function (t) { return head + '|' + t; });               })               .then(function (t) { window.__r = t; })               .catch(function (e) { window.__r = 'caught:' + e; });             </script></body></html>",
+        )]);
+        let mut b = js_browser();
+        b.navigate(&format!("{server}/page"));
+        let read = |b: &mut Browser| -> String {
+            b.page_js
+                .as_mut()
+                .and_then(|p| p.host_eval_for_test("window.__r || ''"))
+                .unwrap_or_default()
+        };
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while !read(&mut b).contains("[POST]") {
+            std::thread::sleep(std::time::Duration::from_millis(5));
+            b.poll_page_js();
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the POST never landed: {:?} seen {:?}",
+                read(&mut b),
+                seen.lock().unwrap()
+            );
+        }
+        let text = read(&mut b);
+        assert!(
+            text.contains("text/plain|200|[POST]"),
+            "Response shape came back: {text:?}"
+        );
+        assert!(
+            text.contains("name=\"name\"") && text.contains("two words"),
+            "multipart fields rode the body: {text:?}"
+        );
+        let requests = seen.lock().unwrap();
+        let post = requests
+            .iter()
+            .find(|(m, p, _, _)| m == "POST" && p == "/submit")
+            .expect("the POST was recorded");
+        assert!(
+            post.2.starts_with("multipart/form-data; boundary="),
+            "FormData set its own content type: {}",
+            post.2
+        );
+        assert!(
+            post.3.contains("name=\"note\"") && post.3.contains("two words"),
+            "the wire body carried the fields: {:?}",
+            post.3
+        );
+    }
+
+    #[cfg(feature = "page-js")]
+    #[test]
+    fn page_js_submit_prevent_default_blocks_engine_submission() {
+        let opened = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let mut b = Browser::new(
+            Box::new(CaptureHost {
+                opened: opened.clone(),
+                messages: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
+            }),
+            Box::new(ApproxMeasurer),
+            (400.0, 600.0),
+        );
+        b.set_page_js(true);
+        b.load_html(
+            "<html><body>             <form id=\"f\" action=\"https://elsewhere.test/go\" method=\"get\">             <input type=\"text\" name=\"q\" value=\"x\">             <input id=\"go\" type=\"submit\" value=\"go\" style=\"width:80px;height:24px\">             </form><p id=\"m\">init</p><script>             document.getElementById('f').addEventListener('submit', function (e) {               e.preventDefault();               document.getElementById('m').textContent = 'held by script';             });             </script></body></html>",
+            "https://example.test/form",
+        );
+        let submit_node = b
+            .page
+            .as_ref()
+            .and_then(|p| p.dom.get_element_by_id("go"))
+            .expect("submit button node");
+        let submit_area = b
+            .last_dl
+            .as_ref()
+            .and_then(|dl| {
+                dl.rects
+                    .iter()
+                    .find(|r| r.node == submit_node.0)
+                    .map(|r| (r.x + r.w / 2.0, r.y + r.h / 2.0))
+            })
+            .expect("submit button rect");
+        b.click(submit_area.0, submit_area.1);
+        assert!(
+            page_text_of(&b).contains("held by script"),
+            "submit listener ran: {:?}",
+            page_text_of(&b)
+        );
+        assert!(
+            opened.lock().unwrap().is_empty(),
+            "preventDefault kept the engine from submitting: {:?}",
+            opened.lock().unwrap()
+        );
+        assert_eq!(b.page_url, "https://example.test/form", "no navigation");
+    }
+
+    #[test]
+    fn loading_events_match_the_synchronous_path() {
+        // The pooled replay must be observable-identical to the inline
+        // load it replaces: same loading-event bracket, including the
+        // load paths' own internal flags. Two routes on one server, two
+        // browsers, one sequence comparison.
+        let server = loopback_html_server(vec![
+            ("/sync", 0, "<html><body><p>parity words</p></body></html>"),
+            ("/bg", 60, "<html><body><p>parity words</p></body></html>"),
+        ]);
+        let flags_sync = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let mut sync_b = Browser::new(
+            Box::new(LoadingHost {
+                flags: flags_sync.clone(),
+                frames: 0,
+            }),
+            Box::new(ApproxMeasurer),
+            (400.0, 600.0),
+        );
+        sync_b.navigate(&format!("{server}/sync"));
+        let sync_seq = flags_sync.lock().unwrap().clone();
+
+        let flags_bg = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let mut bg_b = Browser::new(
+            Box::new(LoadingHost {
+                flags: flags_bg.clone(),
+                frames: 0,
+            }),
+            Box::new(ApproxMeasurer),
+            (400.0, 600.0),
+        );
+        bg_b.set_background_fetch(true);
+        bg_b.navigate(&format!("{server}/bg"));
+        assert_eq!(
+            flags_bg.lock().unwrap().as_slice(),
+            [true],
+            "loading turns on at submit"
+        );
+        drain_until_completes(&mut bg_b);
+        assert_eq!(
+            flags_bg.lock().unwrap().as_slice(),
+            &sync_seq[..],
+            "the pooled load emits the exact synchronous event stream"
+        );
+        assert_eq!(sync_seq.first(), Some(&true), "starts loading");
+        assert_eq!(sync_seq.last(), Some(&false), "ends loaded");
     }
 
     #[test]
@@ -16698,4 +19153,885 @@ div > p { text-decoration: underline }</style></head>\
         b.tick_transitions_at(0.02);
         assert_eq!(frag_counters(&b).0, h0, "still bypassing mid-animation");
     }
+
+    // ── Track B / B5: page-as-data extraction ────────────────────────────
+
+    fn blocks_of(doc: &kitae_json::Value) -> &[kitae_json::Value] {
+        doc.get("blocks").and_then(|v| v.as_arr()).unwrap_or(&[])
+    }
+
+    fn kinds_of(doc: &kitae_json::Value) -> Vec<&str> {
+        blocks_of(doc)
+            .iter()
+            .map(|b| b.get("kind").and_then(|v| v.as_str()).unwrap_or(""))
+            .collect()
+    }
+
+    fn text_of_block(block: &kitae_json::Value) -> &str {
+        block.get("text").and_then(|v| v.as_str()).unwrap_or("")
+    }
+
+    fn rect_of(block: &kitae_json::Value) -> Vec<f64> {
+        block
+            .get("rect")
+            .and_then(|r| r.as_arr())
+            .map(|a| a.iter().filter_map(|v| v.as_f64()).collect())
+            .unwrap_or_default()
+    }
+
+    /// The extraction fixture: every block kind the walker knows, plus a
+    /// hidden subtree and a pruned `<style>` body to prove what is skipped.
+    const B5_PAGE: &str = "<html lang=\"en\"><head><title>Tea Guide</title>\
+<meta name=\"description\" content=\"How to brew tea\">\
+<style>p { color: #123456 }</style></head><body>\
+<h1>Brewing</h1>\
+<p>Water matters. <a href=\"/temp\">Temperature</a> decides everything.</p>\
+<h2>Steps</h2>\
+<ol><li>Boil</li><li>Steep</li></ol>\
+<table><tr><th>Leaf</th><th>Time</th></tr><tr><td>Green</td><td>2m</td></tr></table>\
+<img src=\"/pot.png\" alt=\"A teapot\">\
+<form action=\"/brew\" method=\"post\"><label for=\"amt\">Amount</label>\
+<input id=\"amt\" name=\"amount\" type=\"number\" required placeholder=\"grams\"></form>\
+<div style=\"display: none\"><p>hidden text</p></div>\
+</body></html>";
+
+    #[test]
+    fn b5_extraction_reports_blocks_sections_and_provenance() {
+        let b = test_browser_at(B5_PAGE, "https://tea.test/guide");
+        let doc = extract::document_json(&b);
+
+        assert_eq!(
+            doc.get("url").and_then(|v| v.as_str()),
+            Some("https://tea.test/guide")
+        );
+        assert_eq!(doc.get("title").and_then(|v| v.as_str()), Some("Tea Guide"));
+        assert_eq!(
+            doc.get("description").and_then(|v| v.as_str()),
+            Some("How to brew tea")
+        );
+        assert_eq!(doc.get("lang").and_then(|v| v.as_str()), Some("en"));
+
+        // Document order, one block per semantic unit — and the hidden
+        // subtree plus the `<style>` body appear nowhere.
+        assert_eq!(
+            kinds_of(&doc),
+            vec![
+                "heading",
+                "paragraph",
+                "heading",
+                "list",
+                "table",
+                "image",
+                "form"
+            ]
+        );
+        let serialized = doc.to_json();
+        assert!(
+            !serialized.contains("hidden text") && !serialized.contains("123456"),
+            "pruned content stayed out: {serialized}"
+        );
+
+        // Provenance: every block cites the DOM node it came from, and the
+        // text blocks carry a real box from the last published frame.
+        for block in blocks_of(&doc) {
+            let node = block.get("node").and_then(|v| v.as_f64()).unwrap_or(0.0);
+            assert!(node > 0.0, "block cites a node: {block:?}");
+        }
+        let rect = rect_of(&blocks_of(&doc)[0]);
+        assert_eq!(
+            rect.len(),
+            4,
+            "heading has a rect: {:?}",
+            blocks_of(&doc)[0]
+        );
+        assert!(
+            rect[2] > 0.0 && rect[3] > 0.0,
+            "heading box is real: {rect:?}"
+        );
+
+        // The paragraph: text and its resolved outbound link.
+        let para = &blocks_of(&doc)[1];
+        assert_eq!(
+            text_of_block(para),
+            "Water matters. Temperature decides everything."
+        );
+        let links = para
+            .get("links")
+            .and_then(|v| v.as_arr())
+            .expect("paragraph links");
+        assert_eq!(links.len(), 1);
+        assert_eq!(
+            links[0].get("href").and_then(|v| v.as_str()),
+            Some("https://tea.test/temp")
+        );
+        assert_eq!(
+            links[0].get("text").and_then(|v| v.as_str()),
+            Some("Temperature")
+        );
+
+        // The list keeps its items and order.
+        let list = &blocks_of(&doc)[3];
+        assert_eq!(list.get("ordered").and_then(|v| v.as_bool()), Some(true));
+        let items = list.get("items").and_then(|v| v.as_arr()).unwrap();
+        assert_eq!(items.len(), 2);
+        assert_eq!(text_of_block(&items[0]), "Boil");
+        assert_eq!(text_of_block(&items[1]), "Steep");
+
+        // The table keeps its rows, cells and header flag.
+        let table = &blocks_of(&doc)[4];
+        assert_eq!(table.get("rowCount").and_then(|v| v.as_f64()), Some(2.0));
+        let rows = table.get("rows").and_then(|v| v.as_arr()).unwrap();
+        let first_row = rows[0].as_arr().unwrap();
+        assert_eq!(text_of_block(&first_row[0]), "Leaf");
+        assert_eq!(
+            first_row[0].get("header").and_then(|v| v.as_bool()),
+            Some(true)
+        );
+        assert_eq!(text_of_block(&rows[1].as_arr().unwrap()[1]), "2m");
+
+        // The image carries its resolved src and alt.
+        let image = &blocks_of(&doc)[5];
+        assert_eq!(
+            image.get("src").and_then(|v| v.as_str()),
+            Some("https://tea.test/pot.png")
+        );
+        assert_eq!(image.get("alt").and_then(|v| v.as_str()), Some("A teapot"));
+
+        // The form is fillable data: action, method, and one labelled field.
+        let form = &blocks_of(&doc)[6];
+        assert_eq!(
+            form.get("action").and_then(|v| v.as_str()),
+            Some("https://tea.test/brew")
+        );
+        assert_eq!(form.get("method").and_then(|v| v.as_str()), Some("post"));
+        let fields = form.get("fields").and_then(|v| v.as_arr()).unwrap();
+        assert_eq!(fields.len(), 1);
+        assert_eq!(
+            fields[0].get("name").and_then(|v| v.as_str()),
+            Some("amount")
+        );
+        assert_eq!(
+            fields[0].get("type").and_then(|v| v.as_str()),
+            Some("number")
+        );
+        assert_eq!(
+            fields[0].get("required").and_then(|v| v.as_bool()),
+            Some(true)
+        );
+        assert_eq!(
+            fields[0].get("placeholder").and_then(|v| v.as_str()),
+            Some("grams")
+        );
+        assert_eq!(
+            fields[0].get("label").and_then(|v| v.as_str()),
+            Some("Amount")
+        );
+
+        // The outline: two headings, indices matching their blocks, and
+        // sections that partition the block list without gaps or overlap.
+        let headings = doc.get("headings").and_then(|v| v.as_arr()).unwrap();
+        assert_eq!(headings.len(), 2);
+        assert_eq!(headings[0].get("block").and_then(|v| v.as_f64()), Some(0.0));
+        assert_eq!(headings[0].get("level").and_then(|v| v.as_f64()), Some(1.0));
+        assert_eq!(headings[1].get("block").and_then(|v| v.as_f64()), Some(2.0));
+        assert_eq!(headings[1].get("level").and_then(|v| v.as_f64()), Some(2.0));
+        assert_eq!(
+            headings[1].get("text").and_then(|v| v.as_str()),
+            Some("Steps")
+        );
+        let sections = doc.get("sections").and_then(|v| v.as_arr()).unwrap();
+        assert_eq!(sections.len(), 2);
+        assert_eq!(
+            (
+                sections[0].get("from").and_then(|v| v.as_f64()),
+                sections[0].get("to").and_then(|v| v.as_f64()),
+            ),
+            (Some(1.0), Some(2.0))
+        );
+        assert_eq!(
+            (
+                sections[1].get("from").and_then(|v| v.as_f64()),
+                sections[1].get("to").and_then(|v| v.as_f64()),
+            ),
+            (Some(3.0), Some(7.0))
+        );
+        // Section weight counts nested text (list items, table cells) too:
+        // section one holds the five-word paragraph, section two the two
+        // list items plus the four table cells.
+        assert_eq!(
+            sections[0].get("words").and_then(|v| v.as_f64()),
+            Some(5.0),
+            "first section counts its paragraph: {:?}",
+            sections[0]
+        );
+        assert_eq!(
+            sections[1].get("words").and_then(|v| v.as_f64()),
+            Some(6.0),
+            "second section counts list + table text: {:?}",
+            sections[1]
+        );
+
+        // Counts the agent can budget against.
+        let telemetry = doc.get("telemetry").unwrap();
+        assert_eq!(telemetry.get("images").and_then(|v| v.as_f64()), Some(1.0));
+        assert_eq!(telemetry.get("forms").and_then(|v| v.as_f64()), Some(1.0));
+        assert!(telemetry.get("words").and_then(|v| v.as_f64()).unwrap() >= 10.0);
+        assert_eq!(telemetry.get("truncated"), None);
+    }
+
+    #[test]
+    fn b5_extraction_reports_third_party_hosts_and_mixed_content_refusals() {
+        // No tracker denylist exists in the engine (ROADMAP's not-do
+        // discipline), so the telemetry reports the refusals the engine
+        // itself makes — mixed content — plus the third-party hosts the
+        // page embeds. A denylist is policy, and policy lives in the
+        // agent's permission hook, not in a fact report.
+        let b = test_browser_at(
+            "<html><body><p>Words.</p>\
+             <img src=\"/local.png\" alt=\"first party\">\
+             <img src=\"https://cdn.other.test/a.png\" alt=\"third party\">\
+             <img src=\"http://plain.test/b.png\" alt=\"mixed content\">\
+             <iframe src=\"https://embed.other.test/frame\"></iframe>\
+             </body></html>",
+            "https://tea.test/guide",
+        );
+        let doc = extract::document_json(&b);
+        let telemetry = doc.get("telemetry").unwrap();
+        assert_eq!(telemetry.get("images").and_then(|v| v.as_f64()), Some(3.0));
+        assert_eq!(telemetry.get("iframes").and_then(|v| v.as_f64()), Some(1.0));
+
+        let third_party = telemetry.get("thirdParty").unwrap();
+        let hosts: Vec<&str> = third_party
+            .get("hosts")
+            .and_then(|v| v.as_arr())
+            .unwrap()
+            .iter()
+            .filter_map(|v| v.as_str())
+            .collect();
+        assert_eq!(
+            hosts,
+            vec!["cdn.other.test", "plain.test", "embed.other.test"],
+            "document-order hosts, first-party excluded"
+        );
+        assert_eq!(third_party.get("count").and_then(|v| v.as_f64()), Some(3.0));
+
+        let refused = telemetry.get("refused").unwrap();
+        assert_eq!(refused.get("count").and_then(|v| v.as_f64()), Some(1.0));
+        let urls: Vec<&str> = refused
+            .get("urls")
+            .and_then(|v| v.as_arr())
+            .unwrap()
+            .iter()
+            .filter_map(|v| v.as_str())
+            .collect();
+        assert_eq!(urls, vec!["http://plain.test/b.png"]);
+    }
+
+    #[test]
+    fn b5_extraction_skips_unrendered_subtrees() {
+        let b = test_browser_at(
+            "<html><head><title>t</title><style>.x{color:#ff0000}</style>\
+             <script>var secret = 1;</script></head><body>\
+             <p>real words</p>\
+             <div style=\"display: none\"><p>ghost words</p></div>\
+             <span style=\"visibility: hidden\">invisible words</span>\
+             <template><p>template words</p></template>\
+             </body></html>",
+            "https://tea.test/",
+        );
+        let doc = extract::document_json(&b).to_json();
+        assert!(doc.contains("real words"), "visible text extracted: {doc}");
+        for absent in [
+            "ghost words",
+            "invisible words",
+            "template words",
+            "var secret",
+            "ff0000",
+        ] {
+            assert!(!doc.contains(absent), "`{absent}` stayed out of {doc}");
+        }
+    }
+
+    #[test]
+    fn b5_extraction_bounds_a_hostile_document() {
+        let long = "a".repeat(extract::BLOCK_TEXT_MAX * 2);
+        let html = format!("<html><body><p>{long}</p></body></html>");
+        let b = test_browser_at(&html, "https://tea.test/");
+        let doc = extract::document_json(&b);
+        assert_eq!(kinds_of(&doc), vec!["paragraph"]);
+        let text = text_of_block(&blocks_of(&doc)[0]);
+        assert_eq!(text.chars().count(), extract::BLOCK_TEXT_MAX);
+        assert_eq!(
+            doc.get("telemetry")
+                .unwrap()
+                .get("truncated")
+                .and_then(|v| v.as_bool()),
+            Some(true),
+            "a bounded report says so"
+        );
+    }
+
+    #[test]
+    fn b5_extraction_without_a_page_reports_an_error() {
+        let b = Browser::new(
+            Box::new(NullHost { frames: 0 }),
+            Box::new(ApproxMeasurer),
+            (400.0, 600.0),
+        );
+        let doc = extract::document_json(&b);
+        assert_eq!(
+            doc.get("error").and_then(|v| v.as_str()),
+            Some("no page is open")
+        );
+        assert_eq!(kinds_of(&doc).len(), 0);
+    }
+
+    /// Extraction reads the *live* tree, not the fetched bytes: the same
+    /// `Page` the script session mutated is the one that gets reported.
+    #[cfg(feature = "page-js")]
+    #[test]
+    fn b5_extraction_sees_the_post_script_document() {
+        let mut b = js_browser();
+        b.load_html(
+            "<html><body><p id=\"x\">before</p><script>\
+             var h = document.createElement('h1');\
+             h.textContent = 'Late Heading';\
+             document.body.insertBefore(h, document.getElementById('x'));\
+             </script></body></html>",
+            "https://example.test/js",
+        );
+        let doc = extract::document_json(&b);
+        assert_eq!(kinds_of(&doc), vec!["heading", "paragraph"]);
+        assert_eq!(text_of_block(&blocks_of(&doc)[0]), "Late Heading");
+        assert_eq!(text_of_block(&blocks_of(&doc)[1]), "before");
+    }
+
+    // ── Track B / B2-B4: the agent host (AgentSession) ───────────────────
+
+    /// A headless session with everything allowed — the posture a container
+    /// or a CLI with `--allow "*"` runs in.
+    fn agent_all() -> agent::AgentSession {
+        agent::AgentSession::headless((400.0, 600.0)).with_policy(Box::new(agent::AllowList::all()))
+    }
+
+    const AGENT_PAGE: &str = "<html><head><title>Agent Fixture</title></head><body>\
+<h1>Sign in</h1>\
+<p>The <a href=\"/help\">help page</a> explains the form.</p>\
+<form action=\"/session\" method=\"post\">\
+<label for=\"user\">User</label><input id=\"user\" name=\"user\" type=\"text\" required>\
+<input name=\"token\" type=\"text\" placeholder=\"token\">\
+<button type=\"submit\">Go</button>\
+</form>\
+<p id=\"status\">Idle</p>\
+</body></html>";
+
+    #[test]
+    fn agent_default_policy_is_read_only() {
+        // A session nobody configured cannot mutate anything, and the
+        // refusal names the flag that would allow it.
+        let mut session = agent::AgentSession::headless((400.0, 600.0));
+        let denied = session
+            .permit_and_run(&kitae_agent::Verb::Navigate {
+                url: "https://example.test/".into(),
+            })
+            .unwrap_err();
+        assert!(
+            denied.contains("permission denied") && denied.contains("--allow navigate"),
+            "refusal teaches the fix: {denied}"
+        );
+        // Read-only verbs go through (they cannot change the page).
+        assert!(session.permit_and_run(&kitae_agent::Verb::Read).is_ok());
+        assert!(session.permit_and_run(&kitae_agent::Verb::Extract).is_ok());
+        assert_eq!(session.journal().len(), 3, "refusals are journaled too");
+        assert!(session.journal()[0].denied.is_some());
+        assert!(session.journal()[1].denied.is_none());
+    }
+
+    #[test]
+    fn agent_fill_read_links_find_and_extract_work_on_a_page() {
+        let mut session = agent_all();
+        session
+            .browser_mut()
+            .load_html(AGENT_PAGE, "https://example.test/form");
+
+        // fill: by id, and by a selector that matches an element with no id
+        // (the engine's node-keyed write path is what makes that work).
+        let filled = session
+            .permit_and_run(&kitae_agent::Verb::Fill {
+                target: kitae_agent::Target::Selector("#user".into()),
+                text: "ada".into(),
+            })
+            .expect("fill by id");
+        assert!(filled.contains("ada"), "{filled}");
+        assert_eq!(
+            session.browser().input_value("user").as_deref(),
+            Some("ada")
+        );
+        session
+            .permit_and_run(&kitae_agent::Verb::Fill {
+                target: kitae_agent::Target::Selector("input[name=token]".into()),
+                text: "t0k".into(),
+            })
+            .expect("fill by attribute selector");
+        let doc = extract::document_json(session.browser());
+        let fields = blocks_of(&doc)
+            .iter()
+            .find(|b| b.get("kind").and_then(|v| v.as_str()) == Some("form"))
+            .and_then(|f| f.get("fields"))
+            .and_then(|v| v.as_arr())
+            .expect("form fields");
+        let token_value = fields
+            .iter()
+            .find(|f| f.get("name").and_then(|v| v.as_str()) == Some("token"))
+            .and_then(|f| f.get("value"))
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        assert_eq!(token_value, "t0k", "value landed on the id-less control");
+
+        // read: the page as text.
+        let read = session.permit_and_run(&kitae_agent::Verb::Read).unwrap();
+        assert!(
+            read.contains("Sign in") && read.contains("help page"),
+            "{read}"
+        );
+
+        // links: resolved hrefs with the text that was painted.
+        let links = session.permit_and_run(&kitae_agent::Verb::Links).unwrap();
+        let links: kitae_json::Value = kitae_json::parse(&links).unwrap();
+        // One anchor, one entry — its two word runs merge into the box an
+        // agent would click.
+        assert_eq!(links.get("count").and_then(|v| v.as_f64()), Some(1.0));
+        let first = &links.get("links").unwrap().as_arr().unwrap()[0];
+        assert_eq!(
+            first.get("href").and_then(|v| v.as_str()),
+            Some("https://example.test/help")
+        );
+        assert_eq!(
+            first.get("text").and_then(|v| v.as_str()),
+            Some("help page")
+        );
+        let rect = first.get("rect").unwrap().as_arr().unwrap();
+        assert!(
+            rect[2].as_f64().unwrap() > 60.0,
+            "the merged box spans both words: {rect:?}"
+        );
+
+        // find: matches in page order.
+        let found = session
+            .permit_and_run(&kitae_agent::Verb::Find {
+                query: "help".into(),
+            })
+            .unwrap();
+        let found: kitae_json::Value = kitae_json::parse(&found).unwrap();
+        // One match: find-in-page reports one per painted text run, and
+        // only the "help" run contains the query ("page" is its own run).
+        assert_eq!(found.get("count").and_then(|v| v.as_f64()), Some(1.0));
+        let rects = found.get("matches").unwrap().as_arr().unwrap()[0]
+            .get("rects")
+            .unwrap()
+            .as_arr()
+            .unwrap();
+        assert_eq!(rects.len(), 1, "each match cites the run it paints");
+    }
+
+    #[test]
+    fn agent_click_reports_the_node_it_hit_and_watch_resolves_selectors() {
+        let mut session = agent_all();
+        session
+            .browser_mut()
+            .load_html(AGENT_PAGE, "https://example.test/form");
+
+        let clicked = session
+            .permit_and_run(&kitae_agent::Verb::Click {
+                target: kitae_agent::Target::Selector("h1".into()),
+            })
+            .expect("click a heading is harmless");
+        let clicked: kitae_json::Value = kitae_json::parse(&clicked).unwrap();
+        assert!(clicked.get("node").and_then(|v| v.as_f64()).unwrap() > 0.0);
+        assert_eq!(
+            clicked.get("navigated").and_then(|v| v.as_bool()),
+            Some(false)
+        );
+        assert!(
+            clicked.get("x").and_then(|v| v.as_f64()).is_some(),
+            "the click point is reported: {clicked:?}"
+        );
+
+        // A point target hit-tests through the display list.
+        let by_point = session
+            .permit_and_run(&kitae_agent::Verb::Click {
+                target: kitae_agent::Target::Point { x: 20.0, y: 20.0 },
+            })
+            .unwrap();
+        let by_point: kitae_json::Value = kitae_json::parse(&by_point).unwrap();
+        assert!(by_point.get("node").and_then(|v| v.as_f64()).unwrap() > 0.0);
+
+        // watch: an already-present selector matches immediately, with the
+        // box an agent would click next.
+        let watched = session
+            .permit_and_run(&kitae_agent::Verb::Watch {
+                selector: "#status".into(),
+                timeout_ms: 50,
+            })
+            .unwrap();
+        let watched: kitae_json::Value = kitae_json::parse(&watched).unwrap();
+        assert_eq!(watched.get("matched").and_then(|v| v.as_bool()), Some(true));
+        assert!(watched.get("rect").and_then(|v| v.as_arr()).is_some());
+
+        // …and a selector that never appears times out *honestly* rather
+        // than hanging or claiming success.
+        let missed = session
+            .permit_and_run(&kitae_agent::Verb::Watch {
+                selector: ".never-there".into(),
+                timeout_ms: 30,
+            })
+            .unwrap();
+        let missed: kitae_json::Value = kitae_json::parse(&missed).unwrap();
+        assert_eq!(missed.get("matched").and_then(|v| v.as_bool()), Some(false));
+    }
+
+    /// The engine's link hit test must use the *click point*: a link is
+    /// only activated by a click inside its box. (Regression: the sticky
+    /// shift was applied by passing the link's own y as the point's y,
+    /// which made the vertical test vacuous — every click in the link's
+    /// x-span activated it, however far away it landed.)
+    #[test]
+    fn click_outside_a_link_box_does_not_activate_it() {
+        let html = "<html><body><h1>Sign in</h1>\
+<p>The <a href=\"/help\">help page</a> explains.</p>\
+<p>Filler far below the link, at a completely different height.</p></body></html>";
+        let link = test_browser_at(html, "https://example.test/form")
+            .links()
+            .first()
+            .cloned()
+            .expect("the fixture has a link");
+        // 300px below the link, inside its x-span: must not activate.
+        let mut below = test_browser_at(html, "https://example.test/form");
+        below.click(link.x + 4.0, link.y + 300.0);
+        assert_eq!(
+            below.page_url, "https://example.test/form",
+            "a click far below a link must not follow it"
+        );
+        // Inside the box: activates.
+        let mut inside = test_browser_at(html, "https://example.test/form");
+        inside.click(link.x + 4.0, link.y + link.h / 2.0);
+        assert_eq!(inside.page_url, "https://example.test/help");
+    }
+
+    #[test]
+    fn agent_submit_blocks_on_validation_before_navigating() {
+        // A required field left empty must not reach the network: the
+        // engine's own validation stops it, and the verb reports which
+        // controls failed.
+        let mut session = agent_all();
+        session
+            .browser_mut()
+            .load_html(AGENT_PAGE, "https://example.test/form");
+        session
+            .permit_and_run(&kitae_agent::Verb::Fill {
+                target: kitae_agent::Target::Selector("input[name=token]".into()),
+                text: "only-token".into(),
+            })
+            .unwrap();
+        let submitted = session
+            .permit_and_run(&kitae_agent::Verb::Submit {
+                form: Some("form".into()),
+            })
+            .unwrap();
+        let submitted: kitae_json::Value = kitae_json::parse(&submitted).unwrap();
+        assert_eq!(
+            submitted.get("validationFailed").and_then(|v| v.as_bool()),
+            Some(true),
+            "{submitted:?}"
+        );
+        assert_eq!(
+            submitted.get("navigated").and_then(|v| v.as_bool()),
+            Some(false)
+        );
+        assert!(submitted
+            .get("invalidControls")
+            .and_then(|v| v.as_arr())
+            .map(|a| !a.is_empty())
+            .unwrap_or(false));
+    }
+
+    #[test]
+    fn agent_screenshot_and_pdf_say_what_is_missing() {
+        // No rasterizer installed: the verbs refuse *by name* instead of
+        // returning an empty image an agent would believe.
+        let mut session = agent_all();
+        session
+            .browser_mut()
+            .load_html(AGENT_PAGE, "https://example.test/form");
+        let err = session
+            .permit_and_run(&kitae_agent::Verb::Screenshot { path: None })
+            .unwrap_err();
+        assert!(err.contains("no page rasterizer is installed"), "{err}");
+        assert!(
+            err.contains("kitae_headless"),
+            "the error names the fix: {err}"
+        );
+        let err = session
+            .permit_and_run(&kitae_agent::Verb::Pdf { path: None })
+            .unwrap_err();
+        assert!(err.contains("no page rasterizer is installed"), "{err}");
+    }
+
+    /// A rasterizer that records what it was asked for: proves the verb
+    /// plumbing (path vs inline) without needing a font stack.
+    struct RecordingRaster;
+
+    impl agent::PageRaster for RecordingRaster {
+        fn png(&self, browser: &Browser) -> Result<Vec<u8>, String> {
+            Ok(format!("PNG:{}:{}", browser.page_url, browser.page_title).into_bytes())
+        }
+        fn pdf(&self, browser: &Browser) -> Result<Vec<u8>, String> {
+            Ok(format!("PDF:{}", browser.page_url).into_bytes())
+        }
+    }
+
+    #[test]
+    fn agent_screenshot_writes_a_path_or_returns_inline_base64() {
+        let mut session = agent_all().with_raster(std::sync::Arc::new(RecordingRaster));
+        session
+            .browser_mut()
+            .load_html(AGENT_PAGE, "https://example.test/form");
+
+        let dir = std::env::temp_dir().join(format!("kitae_shot_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("page.png");
+        let written = session
+            .permit_and_run(&kitae_agent::Verb::Screenshot {
+                path: Some(path.to_string_lossy().to_string()),
+            })
+            .unwrap();
+        let written: kitae_json::Value = kitae_json::parse(&written).unwrap();
+        assert_eq!(
+            written.get("mime").and_then(|v| v.as_str()),
+            Some("image/png")
+        );
+        let bytes = std::fs::read(&path).expect("file written");
+        assert!(String::from_utf8_lossy(&bytes).starts_with("PNG:https://example.test/form"));
+
+        // No path: the bytes ride in the result, base64.
+        let inline = session
+            .permit_and_run(&kitae_agent::Verb::Screenshot { path: None })
+            .unwrap();
+        let inline: kitae_json::Value = kitae_json::parse(&inline).unwrap();
+        let encoded = inline.get("png").and_then(|v| v.as_str()).unwrap();
+        assert!(!encoded.is_empty() && inline.get("path").is_none());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn agent_prompt_policy_denies_when_nobody_answers() {
+        // The app's policy shape: an unanswered prompt must become a refusal
+        // (never an allow), and it must not block forever.
+        let policy = agent::PromptPolicy::new(Box::new(|_verb| None))
+            .with_timeout(std::time::Duration::from_millis(60));
+        let answer = agent::PermissionPolicy::check(&policy, &kitae_agent::Verb::Read);
+        assert!(matches!(answer, kitae_agent::Decision::Deny(_)));
+
+        let policy = agent::PromptPolicy::new(Box::new(|verb| Some(verb.name() == "navigate")));
+        assert!(matches!(
+            agent::PermissionPolicy::check(
+                &policy,
+                &kitae_agent::Verb::Navigate {
+                    url: "https://a.test/".into()
+                }
+            ),
+            kitae_agent::Decision::Allow
+        ));
+        assert!(matches!(
+            agent::PermissionPolicy::check(&policy, &kitae_agent::Verb::Read),
+            kitae_agent::Decision::Deny(_)
+        ));
+    }
+
+    #[test]
+    fn agent_allow_list_grammar_is_verb_names_and_a_star() {
+        use kitae_agent::Verb;
+        let list = agent::AllowList::new(&["navigate", "click"]);
+        assert!(list.allows(&Verb::Navigate {
+            url: "https://a.test/".into()
+        }));
+        assert!(list.allows(&Verb::Click {
+            target: kitae_agent::Target::Selector("#a".into())
+        }));
+        // Read-only verbs ride along by default.
+        assert!(list.allows(&Verb::Extract));
+        assert!(!list.allows(&Verb::Fill {
+            target: kitae_agent::Target::Selector("#a".into()),
+            text: "x".into()
+        }));
+
+        let strict = agent::AllowList::none().with_read_only(false);
+        assert!(!strict.allows(&Verb::Extract));
+        assert!(agent::AllowList::all().allows(&Verb::Archive { dir: None }));
+    }
+
+    // ── Track B / B6: archive-and-verify ─────────────────────────────────
+
+    fn evidence_dir(tag: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!("kitae_evidence_{tag}_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn evidence_round_trips_archives_verifies_and_replays() {
+        let dir = evidence_dir("round");
+        let mut session = agent_all();
+        session
+            .browser_mut()
+            .load_html(AGENT_PAGE, "https://example.test/form");
+        let archived = session
+            .permit_and_run(&kitae_agent::Verb::Archive {
+                dir: Some(dir.to_string_lossy().to_string()),
+            })
+            .expect("archive");
+        let archived: kitae_json::Value = kitae_json::parse(&archived).unwrap();
+        assert_eq!(
+            archived.get("signature").and_then(|v| v.as_str()),
+            Some("valid"),
+            "the archive is signed by this device: {archived:?}"
+        );
+        assert!(archived.get("deviceSignPk").is_some());
+        assert!(archived
+            .get("contentSha256")
+            .and_then(|v| v.as_str())
+            .map(|h| h.len() == 64)
+            .unwrap_or(false));
+
+        // Verify through the manifest path.
+        let manifest_path = archived
+            .get("manifestPath")
+            .and_then(|v| v.as_str())
+            .expect("manifest path");
+        let verified = evidence::verify(manifest_path).expect("verify");
+        assert_eq!(
+            verified.get("ok").and_then(|v| v.as_bool()),
+            Some(true),
+            "{verified:?}"
+        );
+        assert_eq!(
+            verified.get("replay").and_then(|v| v.as_str()),
+            Some("match")
+        );
+        let checks = verified.get("checks").and_then(|v| v.as_arr()).unwrap();
+        let names: Vec<&str> = checks
+            .iter()
+            .filter_map(|c| c.get("check").and_then(|v| v.as_str()))
+            .collect();
+        for expected in ["qtsq", "signature", "qtsqSha256", "contentSha256", "replay"] {
+            assert!(
+                names.contains(&expected),
+                "missing check `{expected}`: {names:?}"
+            );
+        }
+
+        // …and the archive path alone still yields the signature verdict.
+        let qtsq_path = archived.get("path").and_then(|v| v.as_str()).unwrap();
+        let verified = evidence::verify(qtsq_path).expect("verify by archive");
+        assert_eq!(
+            verified.get("signature").and_then(|v| v.as_str()),
+            Some("valid")
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn evidence_verify_names_the_check_that_fails() {
+        let dir = evidence_dir("tamper");
+        let mut session = agent_all();
+        session
+            .browser_mut()
+            .load_html(AGENT_PAGE, "https://example.test/form");
+        let archived = session
+            .permit_and_run(&kitae_agent::Verb::Archive {
+                dir: Some(dir.to_string_lossy().to_string()),
+            })
+            .unwrap();
+        let archived: kitae_json::Value = kitae_json::parse(&archived).unwrap();
+        let manifest_path = archived
+            .get("manifestPath")
+            .and_then(|v| v.as_str())
+            .unwrap()
+            .to_string();
+
+        // A manifest whose content digest was edited must fail *that* check,
+        // and only that one.
+        let text = std::fs::read_to_string(&manifest_path).unwrap();
+        let tampered = text.replace(
+            archived
+                .get("contentSha256")
+                .and_then(|v| v.as_str())
+                .unwrap(),
+            &"0".repeat(64),
+        );
+        assert_ne!(text, tampered, "the digest was there to edit");
+        std::fs::write(&manifest_path, &tampered).unwrap();
+
+        let verified = evidence::verify(&manifest_path).expect("verify");
+        assert_eq!(verified.get("ok").and_then(|v| v.as_bool()), Some(false));
+        let checks = verified.get("checks").and_then(|v| v.as_arr()).unwrap();
+        let failed: Vec<&str> = checks
+            .iter()
+            .filter(|c| c.get("ok").and_then(|v| v.as_bool()) == Some(false))
+            .filter_map(|c| c.get("check").and_then(|v| v.as_str()))
+            .collect();
+        assert_eq!(failed, vec!["contentSha256"], "{verified:?}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn evidence_refuses_to_archive_a_session_with_no_page() {
+        let dir = evidence_dir("nopage");
+        let mut session = agent_all();
+        let err = session
+            .permit_and_run(&kitae_agent::Verb::Archive {
+                dir: Some(dir.to_string_lossy().to_string()),
+            })
+            .unwrap_err();
+        assert!(err.contains("nothing to archive"), "{err}");
+        assert!(evidence::verify("/nonexistent/evidence.qtsq").is_err());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+fn node_at_point_in(dl: &DisplayList, x: f32, y: f32) -> Option<NodeId> {
+    let mut text_hit: Option<(f32, u32)> = None;
+    for t in &dl.texts {
+        if t.size <= 0.0 {
+            continue;
+        }
+        let top = t.y - t.size * 0.9;
+        let bottom = t.y + t.size * 0.35;
+        if y >= top && y <= bottom && x >= t.x - 2.0 {
+            if text_hit.map_or(true, |(bx, _)| t.x > bx) {
+                text_hit = Some((t.x, t.node));
+            }
+        }
+    }
+    if let Some((_, node)) = text_hit {
+        return Some(NodeId(node));
+    }
+    for img in dl.images.iter().rev() {
+        if x >= img.x && x <= img.x + img.w && y >= img.y && y <= img.y + img.h {
+            return Some(NodeId(img.node));
+        }
+    }
+    // Painted boxes. Matrix-transformed rects store pre-transform geometry
+    // (the dialog hit-test maps corners through the matrix); this query
+    // tolerates the gap for those rare items.
+    for r in dl.rects.iter().rev() {
+        if r.transform.is_some() {
+            continue;
+        }
+        if x >= r.x && x <= r.x + r.w && y >= r.y && y <= r.y + r.h {
+            return Some(NodeId(r.node));
+        }
+    }
+    None
 }

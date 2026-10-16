@@ -1,0 +1,16 @@
+[package]
+name = "kitae_json"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lib]
+name = "kitae_json"
+
+# The agent plane's wire codec. Deliberately zero-dependency and
+# feature-free: it is linked by the script surface (kitae_script), the
+# engine's extraction layer (kitae_core::extract) and — through them — by
+# the MCP and HTTP transports. It sits below kitae_script in the graph
+# because extraction must work with `page-js` off (a headless server that
+# never runs page scripts still answers `extract`).
+[dependencies]

@@ -1,0 +1,26 @@
+[package]
+name = "kitae_mcp"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "kitae-mcp"
+path = "src/main.rs"
+
+[lib]
+name = "kitae_mcp"
+
+# Tier B2: the Model Context Protocol server — an agent client speaks MCP over
+# stdio and drives a real Kitae browser.
+#
+# Dependencies: kitae_agent (the verb vocabulary), kitae_core (the session),
+# kitae_headless (pixels and print), kitae_json (the wire codec). All
+# workspace-internal; the protocol layer is hand-rolled like the rest of this
+# repo's transports (see docs/SCRIPTING_DECISION.md on the closed-API
+# discipline — no serde, no MCP SDK).
+[dependencies]
+kitae_agent = { path = "../kitae_agent" }
+kitae_core = { path = "../kitae_core" }
+kitae_headless = { path = "../kitae_headless" }
+kitae_json = { path = "../kitae_json" }

@@ -23,6 +23,7 @@ use url::Url;
 mod auth;
 mod download;
 mod h3;
+pub mod pool;
 mod privacy;
 mod sse;
 #[cfg(test)]
@@ -929,7 +930,11 @@ pub(crate) fn fetch_cached_for_origin(raw_url: &str, origin: &str) -> Result<Res
     fetch_cached_kind(raw_url, origin, false)
 }
 
-fn fetch_cached_kind(raw_url: &str, origin: &str, top_level: bool) -> Result<Response, FetchError> {
+pub(crate) fn fetch_cached_kind(
+    raw_url: &str,
+    origin: &str,
+    top_level: bool,
+) -> Result<Response, FetchError> {
     if raw_url.starts_with("file://") && !local_origin_allowed(origin) {
         return Err(FetchError::LocalOrigin(ForbiddenLocalOrigin {
             target: raw_url.to_string(),
@@ -988,7 +993,7 @@ fn cached_policy_url(raw_url: &str, top_level: bool) -> String {
     raw_url.to_string()
 }
 
-fn top_level_request(raw_url: &str, origin: &str) -> bool {
+pub(crate) fn top_level_request(raw_url: &str, origin: &str) -> bool {
     let origin = origin.trim();
     if origin.is_empty() {
         return true;
@@ -1112,7 +1117,7 @@ pub fn fetch_for_origin(
     fetch_for_origin_kind(method, raw_url, headers, body, origin, false)
 }
 
-fn fetch_for_origin_kind(
+pub(crate) fn fetch_for_origin_kind(
     method: &str,
     raw_url: &str,
     headers: &[(String, String)],

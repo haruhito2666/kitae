@@ -1166,6 +1166,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "kitae_agent"
+version = "0.1.0"
+dependencies = [
+ "kitae_json",
+]
+
+[[package]]
 name = "kitae_cli"
 version = "0.1.0"
 dependencies = [
@@ -1180,18 +1187,22 @@ dependencies = [
  "flate2",
  "gif",
  "image-webp",
+ "kitae_agent",
  "kitae_css",
  "kitae_dom",
  "kitae_html",
+ "kitae_json",
  "kitae_layout",
  "kitae_live",
  "kitae_media",
  "kitae_net",
  "kitae_qtsq",
+ "kitae_script",
  "kitae_shape",
  "kitae_style",
  "kitae_ui",
  "percent-encoding",
+ "ring",
  "zeroize",
 ]
 
@@ -1204,11 +1215,32 @@ name = "kitae_dom"
 version = "0.1.0"
 
 [[package]]
+name = "kitae_headless"
+version = "0.1.0"
+dependencies = [
+ "flate2",
+ "fontdb",
+ "kitae_agent",
+ "kitae_core",
+ "kitae_json",
+ "kitae_layout",
+ "kitae_media",
+ "kitae_render_gpu",
+ "png 0.18.1",
+ "tiny-skia",
+ "ttf-parser",
+]
+
+[[package]]
 name = "kitae_html"
 version = "0.1.0"
 dependencies = [
  "kitae_dom",
 ]
+
+[[package]]
+name = "kitae_json"
+version = "0.1.0"
 
 [[package]]
 name = "kitae_layout"
@@ -1228,6 +1260,16 @@ version = "0.1.0"
 dependencies = [
  "getrandom 0.2.17",
  "kitae_ui",
+]
+
+[[package]]
+name = "kitae_mcp"
+version = "0.1.0"
+dependencies = [
+ "kitae_agent",
+ "kitae_core",
+ "kitae_headless",
+ "kitae_json",
 ]
 
 [[package]]
@@ -1302,6 +1344,26 @@ dependencies = [
  "kitae_style",
  "pollster",
  "wgpu",
+]
+
+[[package]]
+name = "kitae_script"
+version = "0.1.0"
+dependencies = [
+ "kitae_agent",
+ "kitae_json",
+ "rquickjs",
+]
+
+[[package]]
+name = "kitae_server"
+version = "0.1.0"
+dependencies = [
+ "kitae_agent",
+ "kitae_core",
+ "kitae_headless",
+ "kitae_json",
+ "kitae_mcp",
 ]
 
 [[package]]
@@ -1874,6 +1936,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "relative-path"
+version = "1.9.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ba39f3699c378cd8970968dcbff9c43159ea4cfbd88d43c00b22f2ef10a435d2"
+
+[[package]]
 name = "renderdoc-sys"
 version = "1.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1965,6 +2033,34 @@ name = "roxmltree"
 version = "0.20.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "6c20b6793b5c2fa6553b250154b78d6d0db37e72700ae35fad9387a46f487c97"
+
+[[package]]
+name = "rquickjs"
+version = "0.9.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "5c5227859c4dfc83f428e58f9569bf439e628c8d139020e7faff437e6f5abaa0"
+dependencies = [
+ "rquickjs-core",
+]
+
+[[package]]
+name = "rquickjs-core"
+version = "0.9.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e82e0ca83028ad5b533b53b96c395bbaab905a5774de4aaf1004eeacafa3d85d"
+dependencies = [
+ "relative-path",
+ "rquickjs-sys",
+]
+
+[[package]]
+name = "rquickjs-sys"
+version = "0.9.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7fed0097b0b4fbb2a87f6dd3b995a7c64ca56de30007eb7e867dfdfc78324ba5"
+dependencies = [
+ "cc",
+]
 
 [[package]]
 name = "rustc-hash"

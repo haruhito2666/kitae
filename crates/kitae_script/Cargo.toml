@@ -1,0 +1,14 @@
+[package]
+name = "kitae_script"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+rquickjs = { version = "0.9", default-features = false, features = ["rust-alloc", "loader"] }
+# The agent plane's wire codec (hand-rolled, zero-dependency), shared with
+# kitae_core::extract — which must shape JSON with page-js off.
+kitae_json = { path = "../kitae_json" }
+# The verb vocabulary (shape + permission hook). Kept out of this crate so a
+# headless consumer can speak verbs without linking QuickJS.
+kitae_agent = { path = "../kitae_agent" }

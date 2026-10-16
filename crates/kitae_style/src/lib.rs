@@ -4072,9 +4072,10 @@ noscript { display: block; }
 [dir="rtl"] { direction: rtl; }
 [dir="ltr"] { direction: ltr; }
 head, title, meta, link, base, script, style, template { display: none; }
-canvas, audio, object, embed { display: none; }
-/* Inline <svg> renders through resvg as a replaced element (R6); canvas
- * needs script — hidden. */
+audio, object, embed { display: none; }
+/* Inline <svg> renders through resvg as a replaced element (R6). A
+ * <canvas> is a replaced element too: page JS draws into its backing
+ * store and the engine paints the registered raster (JS-6). */
 svg { display: inline-block; }
 /* A12: MathML — the 2D constructs (mfrac/msqrt/scripts/over-under) paint
  * through kitae_layout's `math_walk`; this sheet supplies the typography:
@@ -9578,6 +9579,64 @@ fn upsert_var(vars: &mut Vec<(String, String)>, name: String, value: String) {
         slot.1 = value;
     } else {
         vars.push((name, value));
+    }
+}
+
+/// Element *queries* — the read-only side of the matching rules.
+///
+/// The cascade already knows how to ask "does this selector match this
+/// node"; the agent plane (a selector target) and any other embedder need
+/// the same answer as a list. One implementation, so a `querySelector`-style
+/// call and the stylesheet can never disagree about what a selector means.
+pub mod query {
+    use super::{matches, InteractionState, Selector};
+    use kitae_dom::{Dom, NodeId, NodeKind};
+
+    /// Parse one complex selector for a query. `None` when the text is not
+    /// a valid selector — never an empty match set, so callers can tell
+    /// "no match" from "bad selector".
+    pub fn parse(selector_text: &str) -> Option<Selector> {
+        kitae_css::parse_selector(selector_text.trim())
+    }
+
+    /// Every element matching `selector`, in document order. Interaction
+    /// state passes through, so `:hover`/`:focus` selectors answer with
+    /// what the embedder currently reports.
+    pub fn all(dom: &Dom, selector: &Selector, state: &InteractionState) -> Vec<NodeId> {
+        let Some(root) = dom.root() else {
+            return Vec::new();
+        };
+        let mut out = Vec::new();
+        let mut ancestors: Vec<NodeId> = Vec::new();
+        collect(dom, root, selector, state, &mut ancestors, &mut out);
+        out
+    }
+
+    /// Parse and match in one call: `None` for a bad selector, `Some(list)`
+    /// (possibly empty) otherwise.
+    pub fn find(dom: &Dom, selector_text: &str, state: &InteractionState) -> Option<Vec<NodeId>> {
+        let selector = parse(selector_text)?;
+        Some(all(dom, &selector, state))
+    }
+
+    fn collect(
+        dom: &Dom,
+        node: NodeId,
+        selector: &Selector,
+        state: &InteractionState,
+        ancestors: &mut Vec<NodeId>,
+        out: &mut Vec<NodeId>,
+    ) {
+        if matches!(dom.node(node).kind, NodeKind::Element)
+            && matches(selector, dom, node, ancestors, state)
+        {
+            out.push(node);
+        }
+        ancestors.push(node);
+        for &kid in dom.children(node) {
+            collect(dom, kid, selector, state, ancestors, out);
+        }
+        ancestors.pop();
     }
 }
 
